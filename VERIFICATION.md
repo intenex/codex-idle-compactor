@@ -23,4 +23,6 @@ No claim is made that compaction always saves tokens or that private app interfa
 - That task had a 163,202-token pre-compaction request estimate. The compaction request itself recorded 163,459 input tokens, including 15,104 cached and 148,355 uncached, plus 2,222 output tokens. The live app reported 8,754 context tokens afterward. This was a cold manual test beyond the normal automatic window. It does not demonstrate net token savings; no subsequent user turn was created just to measure savings.
 - The desktop app used for the real test was ChatGPT/Codex 26.908.40834, build 8881. Future/older protocol shapes have fixture coverage, not real execution coverage for every released build.
 
+The final installed service automatically upgraded from 0.2.2 to 0.2.4, reported healthy worker and supervisor state, and promoted 0.2.4 to its last known good release. Settings and the ledger containing the completed real attempt retained identical SHA-256 digests through that upgrade. The LaunchAgent is enabled and running.
+
 Final deployment status is maintained in the repository documentation; release archives retain the verification record available when they were signed.
