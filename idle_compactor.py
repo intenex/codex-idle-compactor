@@ -23,11 +23,11 @@ import time
 import uuid
 import compatibility
 
-VERSION = '0.2.1'
+VERSION = '0.2.2'
 FRAME_LIMIT = 32 * 1024 * 1024
 TAIL_LIMIT = 16 * 1024 * 1024
 DEFAULTS = dict(enabled=False, idle_seconds=1500, latest_start_seconds=1740,
-                min_context_tokens=50000, max_context_tokens=180000,
+                min_context_tokens=1024, max_context_tokens=1000000,
                 max_per_day=50, max_per_month=None, cooldown_seconds=86400,
                 poll_seconds=30, exclude_threads=[], allow_threads=[],
                 metered_automation_approved=False)
@@ -334,7 +334,7 @@ def eligibility(a, c, now):
         return 'no-complete-turn-or-usage'
     if a['started'] > a['completed'] or a['user_timestamp'] > a['completed']:
         return 'running-or-new-input'
-    if a['compacted'] >= a['completed']:
+    if a['compacted'] >= a['usage_timestamp']:
         return 'already-compacted'
     idle = now - a['last_activity']
     if idle < c['idle_seconds']:
@@ -342,7 +342,7 @@ def eligibility(a, c, now):
     if idle >= c['latest_start_seconds']:
         return 'missed-idle-window'
     if not c['min_context_tokens'] <= a['context_tokens'] <= c['max_context_tokens']:
-        return 'context-outside-pilot-range'
+        return 'context-outside-configured-range'
     return None
 
 

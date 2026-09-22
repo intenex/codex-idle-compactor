@@ -100,9 +100,15 @@ class Tests(unittest.TestCase):
         a={**self.a,'compacted':self.a['completed']+1}
         self.assertEqual(m.eligibility(a,self.c,NOW),'already-compacted')
 
+    def test_compaction_before_turn_complete_is_not_repeated(self):
+        a={**self.a,'compacted':self.a['completed']-0.017}
+        self.assertEqual(m.eligibility(a,self.c,NOW),'already-compacted')
+        a['usage_timestamp']=a['compacted']+1
+        self.assertIsNone(m.eligibility(a,self.c,NOW))
+
     def test_context_bounds(self):
-        for n in [49999,180001]:
-            self.assertEqual(m.eligibility({**self.a,'context_tokens':n},self.c,NOW),'context-outside-pilot-range')
+        for n in [1023,1000001]:
+            self.assertEqual(m.eligibility({**self.a,'context_tokens':n},self.c,NOW),'context-outside-configured-range')
 
     def test_truncated_record_ignored(self):
         with self.file.open('a') as f:f.write('{"type":')

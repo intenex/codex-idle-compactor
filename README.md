@@ -36,7 +36,7 @@ Updates come from public GitHub releases. There is no hosted worker, paid update
 |---|---|
 | Idle threshold | 25 minutes since recorded activity |
 | Latest dispatch | Before 29 minutes of inactivity |
-| Context estimate | 50,000–180,000 tokens from the most recent request |
+| Context estimate | 1,024–1,000,000 tokens from the most recent request |
 | Per-task cooldown | 24 hours |
 | Global attempts | 50/day (UTC); no monthly cap |
 | Repeated cache warming | None |
