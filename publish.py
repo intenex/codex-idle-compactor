@@ -48,7 +48,7 @@ def main():
     (a.out/'update.json').write_bytes(raw)
     notes=a.out/'release-notes.md'
     notes.write_text('Signed automatic update for Codex Idle Compactor '+a.version+'.\n\n'
-                     'Compatible local desktop tasks are detected by protocol capabilities. Ordinary ChatGPT web/Classic chats and remote/cloud tasks are not supported. Existing compaction settings and limits are preserved.\n')
+                     'The per-task cooldown and cold-compaction override are removed. The utility triggers at 25 minutes since the last recorded model usage and stops dispatch before 29 minutes, with timing rechecked immediately before sending. This is a best-effort timing policy, not a guaranteed cache hit. Signed updates, existing attempt limits, and the ledger are preserved. See README.md for coverage and policy details.\n')
     if a.publish:
         subprocess.run(['gh','release','create','v'+a.version,'--repo',u.REPO,'--draft',
                         '--title','Idle Compactor '+a.version,'--notes-file',str(notes),str(archive),str(a.out/'update.json')],check=True)

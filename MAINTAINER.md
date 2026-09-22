@@ -5,13 +5,14 @@ The update source is the latest non-prerelease release in `intenex/codex-idle-co
 ## Release procedure
 
 1. Edit the code and add regression coverage for the incompatible app behavior. Treat installed JavaScript as data when discovering capabilities; never execute it in the updater. Do not remove idle checks or spend limits to force compatibility.
+   Preserve the user-approved time-based policy: use the latest model-usage timestamp, trigger at 25 minutes, and stop dispatch before 29 minutes. Never describe this as a guaranteed cache hit. There is no per-task cooldown or cold-compaction bypass to restore.
 2. Increment `VERSION` in `idle_compactor.py` and `launcher.py`, and the version in `release.json`. Use a new numeric version for every release, including a release that restores older code.
 3. Run `python3 -m unittest discover -s . -v` and perform live read-only compatibility checks. If compaction behavior changed, distinguish simulated checks from a real accepted/completed operation.
 4. Commit and push the reviewed source to the repository's default branch.
 5. Publish locally with the command below. It reruns tests, builds a ZIP from an explicit file allowlist, signs its manifest, creates a draft release, uploads all assets, then publishes it as latest.
 
 ```sh
-python3 publish.py --version 0.2.5 --out /path/to/release-output --publish
+python3 publish.py --version NEXT_VERSION --out /path/to/release-output --publish
 ```
 
 Use the actual next version in that command. No release or build job runs automatically on GitHub. The CLI needs the maintainer's GitHub login and local signing key. Never put the private signing key in this repository, a release, or a friend's installation.
@@ -38,4 +39,4 @@ A new app feature can be unsupported until an adapter exists. Automatic updating
 
 GitHub's [release documentation](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases) specifies no total release-size or release-bandwidth quota. This project uses release assets, not Git LFS, GitHub Packages, or Actions artifacts. Normal hosting compute consumption is zero; there are no cron jobs or CI workflows. A client checks one manifest about 1,440 times per 30-day month while continuously awake and downloads the package only for a new version. The client enforces a 5 MiB compressed package cap, a 20 MiB extracted cap, bounded redirects, and request deadlines.
 
-Automatic compaction remains a separate metered activity with preserved user-approved attempt caps. Updating software does not enlarge those caps, reset the ledger, turn a paused installation back on, enable paid overages, or change the account's plan.
+The 50/day ceiling and no monthly cap reflect the owner's explicit instructions; they are not a cache guarantee. The daily cap permits at most 1,500 utility attempts in a 30-day month, before per-turn deduplication and timing exclusions. It bounds requests, not model tokens or subscription quota, and the owner has explicitly authorized this metered path. Updating software does not enlarge those caps, reset the ledger, turn a paused installation back on, enable paid overages, or change the account's plan.

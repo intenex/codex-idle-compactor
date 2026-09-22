@@ -92,21 +92,26 @@ class Tests(unittest.TestCase):
             self.assertEqual(m.eligibility(m.activity(self.file),self.c,NOW),'running-or-new-input')
 
     def test_idle_boundaries(self):
-        for elapsed, expected in [(1499,'not-idle-long-enough'),(1500,None),(1739,None),(1740,'missed-idle-window'),(90000,'missed-idle-window')]:
-            a={**self.a,'last_activity':NOW-elapsed}
+        for elapsed, expected in [(1499,'not-idle-long-enough'),(1500,None),(1739,None),(1740,'missed-cache-window'),(1800,'missed-cache-window'),(90000,'missed-cache-window')]:
+            a={**self.a,'usage_timestamp':NOW-elapsed}
             self.assertEqual(m.eligibility(a,self.c,NOW),expected)
 
     def test_compacted_after_completion(self):
         a={**self.a,'compacted':self.a['completed']+1}
         self.assertEqual(m.eligibility(a,self.c,NOW),'already-compacted')
 
-    def test_manual_cold_override_preserves_idle_and_busy_guards(self):
-        a={**self.a,'last_activity':NOW-90000}
-        self.assertIsNone(m.eligibility(a,self.c,NOW,allow_cold=True))
-        self.assertEqual(m.eligibility(self.a,self.c,NOW-100,allow_cold=True),'not-idle-long-enough')
-        self.assertEqual(m.eligibility({**a,'started':NOW},self.c,NOW,allow_cold=True),'running-or-new-input')
-        with self.assertRaises(m.GuardError):
-            m.scan(self.config_root,self.home,self.app,execute=True,allow_cold=True)
+    def test_invalid_missing_or_future_usage_time_never_dispatches(self):
+        for timestamp in (float('nan'),float('inf'),float('-inf')):
+            self.assertEqual(m.cache_window_reason(timestamp,self.c,NOW),'invalid-cache-clock')
+        for timestamp in (0,NOW+100):
+            self.assertEqual(m.cache_window_reason(timestamp,self.c,NOW),'not-idle-long-enough')
+
+    def test_manual_cold_override_removed(self):
+        argv=['idle_compactor.py','--state',str(self.config_root),'compact','thread-1','--allow-cold']
+        with patch.object(m.sys,'argv',argv),contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as result:m.main()
+        self.assertEqual(result.exception.code,2)
+        self.assertEqual(self.ledger.summary(),[])
 
     def test_compaction_before_turn_complete_is_not_repeated(self):
         a={**self.a,'compacted':self.a['completed']-0.017}
@@ -139,7 +144,112 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.ledger.reason('thread-2','turn-2',self.c,NOW),'unresolved-attempt-review-required')
         self.ledger.status(aid,'completed')
         self.assertEqual(self.ledger.reason('thread-1','turn-1',self.c,NOW),'already-attempted-this-turn')
-        self.assertEqual(self.ledger.reason('thread-1','turn-2',self.c,NOW),'per-task-cooldown')
+        self.assertIsNone(self.ledger.reason('thread-1','turn-2',self.c,NOW))
+
+    def test_same_task_new_turns_have_no_cooldown_after_restart(self):
+        for i in range(50):
+            aid=self.ledger.reserve({'id':'thread-1'},{**self.a,'turn_id':str(i)},self.c,NOW+i)
+            self.ledger.status(aid,'completed')
+        self.ledger.close();self.ledger=m.Ledger(self.config_root)
+        self.assertEqual(self.ledger.reason('thread-1','0',self.c,NOW+100),'already-attempted-this-turn')
+        self.assertEqual(self.ledger.reason('thread-1','51',self.c,NOW+100),'daily-cap')
+        self.assertIsNone(self.ledger.reason('thread-1','51',self.c,NOW+86400))
+
+    def test_legacy_cooldown_is_ignored(self):
+        m.atomic_json(self.config_root/'config.json',{**self.c,'cooldown_seconds':86400})
+        config=m.config_read(self.config_root)
+        self.assertNotIn('cooldown_seconds',config)
+        aid=self.ledger.reserve({'id':'thread-1'},self.a,config,NOW)
+        self.ledger.status(aid,'completed')
+        self.assertIsNone(self.ledger.reason('thread-1','turn-2',config,NOW+1500))
+
+    def test_expired_model_usage_cannot_be_refreshed_by_nonmodel_activity(self):
+        self.write(records(NOW-600)+[row('event_msg',{'type':'task_complete','turn_id':'turn-1'},NOW-1500)])
+        a=m.activity(self.file)
+        self.assertEqual(m.eligibility(a,self.c,NOW),'missed-cache-window')
+        class Fake:
+            def __init__(self,*args):pass
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def snapshot(self,tid):return state(a)
+            def compact(self,*args):raise AssertionError('must not dispatch')
+        m.atomic_json(self.config_root/'config.json',{**self.c,'enabled':True,'metered_automation_approved':True})
+        for automatic in (False,True):
+            with patch.object(m.time,'time',return_value=NOW),self.assertRaisesRegex(m.GuardError,'missed-cache-window'):
+                m.run_compaction({'id':'thread-1','path':self.file},a,self.c,self.config_root,
+                    self.home,self.app,self.ledger,automatic=automatic,desktop_factory=Fake)
+        self.assertEqual(self.ledger.summary(),[])
+
+    def test_scan_expired_window_blocks_automatic_and_manual(self):
+        self.write(records(NOW-600))
+        m.atomic_json(self.config_root/'config.json',{**self.c,'enabled':True,
+            'metered_automation_approved':True,'cooldown_seconds':86400})
+        candidate={'id':'thread-1','path':self.file}
+        for execute in (False,True):
+            for tid in (None,'thread-1'):
+                with patch.object(m,'candidates',return_value=[candidate]),patch.object(m.time,'time',return_value=NOW),patch.object(m,'Desktop') as desktop:
+                    result=m.scan(self.config_root,self.home,self.app,execute=execute,thread_id=tid)
+                desktop.assert_not_called()
+                self.assertEqual(result[0]['decision'],'missed-cache-window')
+        self.assertEqual(self.ledger.summary(),[])
+
+    def test_enable_cleans_legacy_cooldown_and_keeps_approved_limits(self):
+        m.atomic_json(self.config_root/'config.json',{**self.c,'enabled':True,'cooldown_seconds':86400})
+        argv=['idle_compactor.py','--state',str(self.config_root),'enable',
+              '--accept-metered-compaction','--max-per-day','50','--max-per-month','none']
+        output=io.StringIO()
+        with patch.object(m.sys,'argv',argv),contextlib.redirect_stdout(output):m.main()
+        self.assertEqual(json.loads(output.getvalue())['compaction']['policy'],'time-based-best-effort')
+        config=json.loads((self.config_root/'config.json').read_text())
+        self.assertTrue(config['enabled'])
+        self.assertTrue(config['metered_automation_approved'])
+        self.assertNotIn('cooldown_seconds',config)
+        self.assertEqual(config['max_per_day'],50)
+        self.assertIsNone(config['max_per_month'])
+
+    def test_duplicate_usage_records_do_not_refresh_cache_clock(self):
+        original=records()[2]
+        original['payload']['response_id']='response-1'
+        self.write(records()[:2]+[original]+records()[3:]+[{**original,'timestamp':row('',{},NOW)['timestamp']}])
+        self.assertEqual(m.activity(self.file)['usage_timestamp'],NOW-1530)
+        legacy=[r for r in records() if r['type']!='token_usage_record']
+        repeated={**legacy[2],'timestamp':row('',{},NOW)['timestamp']}
+        self.write(legacy+[repeated])
+        self.assertEqual(m.activity(self.file)['usage_timestamp'],NOW-1525)
+
+    def test_preflight_delay_past_window_does_not_reserve(self):
+        a=self.a;clock=[NOW]
+        class Fake:
+            def __init__(self,*args):pass
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def snapshot(self,tid):
+                clock[0]=a['usage_timestamp']+1740
+                return state(a)
+            def compact(self,*args):raise AssertionError('must not dispatch')
+        with patch.object(m.time,'time',side_effect=lambda:clock[0]),self.assertRaisesRegex(m.GuardError,'missed-cache-window'):
+            m.run_compaction({'id':'thread-1','path':self.file},a,self.c,self.config_root,
+                self.home,self.app,self.ledger,desktop_factory=Fake)
+        self.assertEqual(self.ledger.summary(),[])
+
+    def test_reservation_delay_past_window_does_not_dispatch_or_block_others(self):
+        a=self.a;clock=[NOW];reserve=self.ledger.reserve
+        class Fake:
+            def __init__(self,*args):pass
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def snapshot(self,tid):return state(a)
+            def compact(self,*args):raise AssertionError('must not dispatch')
+        def slow_reserve(*args):
+            result=reserve(*args)
+            clock[0]=a['usage_timestamp']+1740
+            return result
+        with patch.object(m.time,'time',side_effect=lambda:clock[0]),patch.object(self.ledger,'reserve',side_effect=slow_reserve):
+            result=m.run_compaction({'id':'thread-1','path':self.file},a,self.c,self.config_root,
+                self.home,self.app,self.ledger,desktop_factory=Fake)
+        self.assertEqual(result['status'],'skipped-no-dispatch')
+        self.assertIsNone(self.ledger.reason('other','other',self.c,NOW))
+        self.assertEqual(self.ledger.reconcile(self.home),[])
 
     def test_limits_and_restart(self):
         self.c.update(max_per_day=2,max_per_month=20)
@@ -238,7 +348,7 @@ class Tests(unittest.TestCase):
             def __enter__(self):return self
             def __exit__(self,*args):pass
             def snapshot(self,tid):return state(a)
-            def compact(self):pass
+            def compact(self,*args):pass
         with patch.object(m.time,'time',return_value=NOW):
             r=m.run_compaction({'id':'thread-1','path':self.file},a,self.c,self.config_root,
                 self.home,self.app,self.ledger,desktop_factory=Fake,timeout=0)
@@ -252,7 +362,7 @@ class Tests(unittest.TestCase):
             def __enter__(self):return self
             def __exit__(self,*args):pass
             def snapshot(self,tid):return state(a)
-            def compact(self):test.write(records()+[row('compacted',{},NOW)])
+            def compact(self,*args):test.write(records()+[row('compacted',{},NOW)])
         with patch.object(m.time,'time',return_value=NOW):
             r=m.run_compaction({'id':'thread-1','path':self.file},a,self.c,self.config_root,
                 self.home,self.app,self.ledger,desktop_factory=Fake)
@@ -266,7 +376,7 @@ class Tests(unittest.TestCase):
             def __enter__(self):return self
             def __exit__(self,*args):pass
             def snapshot(self,tid):return state(a)
-            def compact(self):Fake.called=True
+            def compact(self,*args):Fake.called=True
         with self.assertRaises(m.GuardError):
             m.run_compaction({'id':'thread-1','path':self.file},a,self.c,self.config_root,
                 self.home,self.app,self.ledger,automatic=True,desktop_factory=Fake)
@@ -282,7 +392,7 @@ class Tests(unittest.TestCase):
             def snapshot(self,tid):
                 test.write(records()+[row('response_item',{'role':'user'},NOW)])
                 return state(a)
-            def compact(self):raise AssertionError('must not dispatch')
+            def compact(self,*args):raise AssertionError('must not dispatch')
         with self.assertRaises(m.GuardError):
             m.run_compaction({'id':'thread-1','path':self.file},a,self.c,self.config_root,
                 self.home,self.app,self.ledger,desktop_factory=Fake)
@@ -295,7 +405,7 @@ class Tests(unittest.TestCase):
             def __enter__(self):return self
             def __exit__(self,*args):pass
             def snapshot(self,tid):return state(a)
-            def compact(self):raise TimeoutError()
+            def compact(self,*args):raise TimeoutError()
         with patch.object(m.time,'time',return_value=NOW):
             with self.assertRaises(TimeoutError):
                 m.run_compaction({'id':'thread-1','path':self.file},a,self.c,self.config_root,
@@ -323,7 +433,7 @@ class Tests(unittest.TestCase):
             def snapshot(self,tid):
                 m.atomic_json(test.config_root/'config.json',{**m.DEFAULTS,'exclude_threads':['thread-1']})
                 return state(a)
-            def compact(self):raise AssertionError('must not dispatch')
+            def compact(self,*args):raise AssertionError('must not dispatch')
         with self.assertRaises(m.GuardError):
             m.run_compaction({'id':'thread-1','path':self.file},a,self.c,self.config_root,
                 self.home,self.app,self.ledger,desktop_factory=Fake)
@@ -364,8 +474,9 @@ class Tests(unittest.TestCase):
         self.assertIsNone(metrics['compaction_usage'])
         self.assertIsNone(metrics['first_resume_usage'])
 
-    def test_ipc_real_socket_framing_and_dispatch(self):
-        # Full client protocol over a real Unix socket; no model call.
+    def test_ipc_real_socket_framing_and_final_timing_guard(self):
+        # Real socket framing with a fake server; no model call. Verify the
+        # final transport guard both allows a timely request and rejects late ones.
         ipc=self.home/'ipc';ipc.mkdir(mode=0o700)
         path=ipc/'ipc.sock'
         server=socket.socket(socket.AF_UNIX);server.bind(str(path));path.chmod(0o600);server.listen(1)
@@ -405,9 +516,17 @@ class Tests(unittest.TestCase):
         t=threading.Thread(target=serve);t.start()
         with m.Desktop(self.home,self.app) as client:
             self.assertEqual(client.snapshot('thread-1')['id'],'thread-1')
-            client.compact()
+            with patch.object(m.time,'time',return_value=NOW):
+                client.compact(a['usage_timestamp'],self.c)
+            for age in (1740,1800,1801,90000):
+                with patch.object(m.time,'time',return_value=a['usage_timestamp']+age):
+                    with self.assertRaisesRegex(m.DispatchSkipped,'missed-cache-window'):
+                        client.compact(a['usage_timestamp'],self.c)
+            with patch.object(m.time,'time',return_value=a['usage_timestamp']+1800):
+                with self.assertRaises(m.DispatchSkipped):
+                    client.compact(a['usage_timestamp'],{**self.c,'latest_start_seconds':9999})
         t.join(4)
         self.assertFalse(t.is_alive());self.assertEqual(errors,[])
-        self.assertIn('thread-follower-compact-thread',methods)
+        self.assertEqual(methods.count('thread-follower-compact-thread'),1)
 
 if __name__=='__main__':unittest.main()

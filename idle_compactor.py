@@ -10,6 +10,7 @@ import contextlib
 import datetime as dt
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import plistlib
@@ -23,18 +24,38 @@ import time
 import uuid
 import compatibility
 
-VERSION = '0.2.4'
+VERSION = '0.2.5'
 FRAME_LIMIT = 32 * 1024 * 1024
 TAIL_LIMIT = 16 * 1024 * 1024
 DEFAULTS = dict(enabled=False, idle_seconds=1500, latest_start_seconds=1740,
                 min_context_tokens=1024, max_context_tokens=1000000,
-                max_per_day=50, max_per_month=None, cooldown_seconds=86400,
+                max_per_day=50, max_per_month=None,
                 poll_seconds=30, exclude_threads=[], allow_threads=[],
                 metered_automation_approved=False)
 LABEL = 'local.codex-idle-compactor'
 
 class GuardError(RuntimeError):
     pass
+
+class DispatchSkipped(GuardError):
+    """A timing rejection before the compaction request was sent."""
+    pass
+
+def dispatch_policy():
+    return dict(policy='time-based-best-effort', cache_clock='last-recorded-model-usage',
+                cache_hit_guaranteed=False)
+
+def cache_window_reason(usage_timestamp, c, now):
+    if not math.isfinite(usage_timestamp) or not math.isfinite(now):
+        return 'invalid-cache-clock'
+    age = now - usage_timestamp
+    if not usage_timestamp or age < c['idle_seconds']:
+        return 'not-idle-long-enough'
+    # A final transport check also enforces the hard 30-minute ceiling even if
+    # called with an unchecked configuration. Normal config ends at 29 minutes.
+    if age >= min(c['latest_start_seconds'], 1800):
+        return 'missed-cache-window'
+    return None
 
 def timestamp(value):
     if isinstance(value, (float, int)):
@@ -69,9 +90,10 @@ def config_read(root):
         atomic_json(path, DEFAULTS)
     c = dict(DEFAULTS)
     c.update(json.loads(path.read_text()))
+    # Retired usage guard: old installations must not retain a hidden cooldown.
+    c.pop('cooldown_seconds', None)
     for name in ('idle_seconds', 'latest_start_seconds', 'min_context_tokens',
-                 'max_context_tokens', 'max_per_day',
-                 'cooldown_seconds', 'poll_seconds'):
+                 'max_context_tokens', 'max_per_day', 'poll_seconds'):
         if type(c[name]) is not int or c[name] <= 0:
             raise GuardError('Invalid positive integer setting: ' + name)
     if not 60 <= c['idle_seconds'] < c['latest_start_seconds'] < 1800:
@@ -82,8 +104,6 @@ def config_read(root):
         raise GuardError('Daily attempt ceiling is 50')
     if c['max_per_month'] is not None and (type(c['max_per_month']) is not int or c['max_per_month'] <= 0):
         raise GuardError('Monthly cap must be a positive integer or null for no cap')
-    if c['cooldown_seconds'] < 3600:
-        raise GuardError('Minimum per-task cooldown is one hour')
     for name in ('enabled', 'metered_automation_approved'):
         if type(c[name]) is not bool:
             raise GuardError('Invalid boolean setting: ' + name)
@@ -228,7 +248,10 @@ class Desktop:
             self.receive()
         return self.snapshots.pop(thread_id)
 
-    def compact(self):
+    def compact(self, usage_timestamp, config):
+        reason = cache_window_reason(usage_timestamp, config, time.time())
+        if reason:
+            raise DispatchSkipped(reason)
         r = self.request('thread-follower-compact-thread',
                          dict(conversationId=self.thread_id), owner=self.owner)
         if r.get('result', {}).get('ok') is not True:
@@ -263,6 +286,8 @@ def activity(path):
                   usage_timestamp=0.0, user_timestamp=0.0)
     modern_usage = None
     legacy_usage = None
+    seen_responses = set()
+    previous_legacy_info = None
     for row in read_tail(path):
         t = timestamp(row.get('timestamp'))
         typ, p = row.get('type'), row.get('payload', {})
@@ -274,7 +299,11 @@ def activity(path):
         if typ == 'compacted':
             result['compacted'] = max(result['compacted'], t)
         if typ == 'token_usage_record':
-            modern_usage = (t, p.get('usage', {}))
+            response_id = p.get('response_id')
+            if not response_id or response_id not in seen_responses:
+                modern_usage = (t, p.get('usage', {}))
+                if response_id:
+                    seen_responses.add(response_id)
         if typ == 'event_msg':
             if p.get('type') == 'task_started':
                 result['started'] = t
@@ -282,7 +311,10 @@ def activity(path):
                 result['completed'] = t
                 result['turn_id'] = p.get('turn_id')
             if p.get('type') == 'token_count' and p.get('info'):
-                legacy_usage = (t, p['info'].get('last_token_usage', {}))
+                info = p['info']
+                if info != previous_legacy_info:
+                    legacy_usage = (t, info.get('last_token_usage', {}))
+                    previous_legacy_info = info
     # Prefer modern usage rather than adding both record formats.
     usage = modern_usage or legacy_usage
     if usage:
@@ -292,7 +324,7 @@ def activity(path):
                       output_tokens=u.get('output_tokens', 0))
         result['context_tokens'] = u.get('input_tokens', 0) + u.get('output_tokens', 0)
     result['fingerprint'] = ':'.join(str(result[k]) for k in
-                                  ('turn_id', 'last_activity', 'context_tokens', 'compacted'))
+                                  ('turn_id', 'last_activity', 'usage_timestamp', 'context_tokens', 'compacted'))
     return result
 
 
@@ -329,18 +361,18 @@ def candidates(home, now, thread_id=None):
         yield dict(id=row['id'],path=path,model=row['model'])
 
 
-def eligibility(a, c, now, allow_cold=False):
+def eligibility(a, c, now):
     if not a['turn_id'] or not a['completed'] or not a['usage_timestamp']:
         return 'no-complete-turn-or-usage'
     if a['started'] > a['completed'] or a['user_timestamp'] > a['completed']:
         return 'running-or-new-input'
     if a['compacted'] >= a['usage_timestamp']:
         return 'already-compacted'
-    idle = now - a['last_activity']
-    if idle < c['idle_seconds']:
-        return 'not-idle-long-enough'
-    if not allow_cold and idle >= c['latest_start_seconds']:
-        return 'missed-idle-window'
+    # The app provides response usage time, not the provider's cache-write time.
+    # Non-model activity must never make an old response look freshly cached.
+    reason = cache_window_reason(a['usage_timestamp'], c, now)
+    if reason:
+        return reason
     if not c['min_context_tokens'] <= a['context_tokens'] <= c['max_context_tokens']:
         return 'context-outside-configured-range'
     return None
@@ -385,14 +417,11 @@ class Ledger:
         self.db.commit()
 
     def reason(self, thread_id, turn_id, c, now):
-        if self.db.execute("SELECT 1 FROM attempts WHERE status != 'completed' LIMIT 1").fetchone():
+        if self.db.execute("SELECT 1 FROM attempts WHERE status NOT IN ('completed','skipped-no-dispatch') LIMIT 1").fetchone():
             return 'unresolved-attempt-review-required'
         if self.db.execute('SELECT 1 FROM attempts WHERE thread_id=? AND turn_id=?',
                            (thread_id, turn_id)).fetchone():
             return 'already-attempted-this-turn'
-        if self.db.execute('SELECT 1 FROM attempts WHERE thread_id=? AND started>?',
-                           (thread_id, now - c['cooldown_seconds'])).fetchone():
-            return 'per-task-cooldown'
         utc = dt.datetime.fromtimestamp(now, dt.timezone.utc)
         day = utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         month = utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
@@ -425,7 +454,7 @@ class Ledger:
 
     def reconcile(self, home):
         results = []
-        for aid, tid, before in self.db.execute("SELECT id,thread_id,before_compacted FROM attempts WHERE status != 'completed'").fetchall():
+        for aid, tid, before in self.db.execute("SELECT id,thread_id,before_compacted FROM attempts WHERE status NOT IN ('completed','skipped-no-dispatch')").fetchall():
             rows = list(candidates(home, time.time(), tid))
             if rows and activity(rows[0]['path'])['compacted'] > before:
                 self.status(aid, 'completed')
@@ -443,9 +472,7 @@ class Ledger:
 
 
 def run_compaction(row, a, c, root, home, app, ledger, automatic=False,
-                   desktop_factory=Desktop, timeout=180, allow_cold=False):
-    if automatic and allow_cold:
-        raise GuardError('Cold compaction requires an explicit manual task')
+                   desktop_factory=Desktop, timeout=180):
     with desktop_factory(home, app) as desktop:
         state = desktop.snapshot(row['id'])
         live_guard(state, a, c, row['id'])
@@ -458,13 +485,21 @@ def run_compaction(row, a, c, root, home, app, ledger, automatic=False,
             raise GuardError('Automatic compaction is paused')
         if row['id'] in current['exclude_threads'] or (current['allow_threads'] and row['id'] not in current['allow_threads']):
             raise GuardError('Task excluded by current configuration')
-        reason = eligibility(fresh, current, time.time(), allow_cold=allow_cold)
+        reason = eligibility(fresh, current, time.time())
         if reason:
             raise GuardError(reason)
         attempt = ledger.reserve(row, fresh, current, time.time())
         try:
-            desktop.compact()
+            # Check again after the durable reservation and at the transport.
+            # Slow IPC discovery or disk writes must not overrun the window.
+            reason = cache_window_reason(fresh['usage_timestamp'], current, time.time())
+            if reason:
+                raise DispatchSkipped(reason)
+            desktop.compact(fresh['usage_timestamp'], current)
             ledger.status(attempt, 'acknowledged')
+        except DispatchSkipped as e:
+            ledger.status(attempt, 'skipped-no-dispatch')
+            return {'thread_id': row['id'], 'status': 'skipped-no-dispatch', 'decision': str(e)}
         except Exception:
             ledger.status(attempt, 'uncertain-no-retry')
             raise
@@ -491,9 +526,7 @@ def run_compaction(row, a, c, root, home, app, ledger, automatic=False,
         return {'thread_id': row['id'], 'status': 'unverified-timeout-no-retry'}
 
 
-def scan(root, home, app, execute=False, thread_id=None, allow_cold=False):
-    if allow_cold and not thread_id:
-        raise GuardError('Cold compaction requires an explicit manual task')
+def scan(root, home, app, execute=False, thread_id=None):
     c = config_read(root)
     verify_app(app)
     if execute and not thread_id and not (c['enabled'] and c['metered_automation_approved']):
@@ -509,14 +542,16 @@ def scan(root, home, app, execute=False, thread_id=None, allow_cold=False):
                 continue
             try:
                 a = activity(row['path'])
-                reason = eligibility(a, c, time.time(), allow_cold=allow_cold) or ledger.reason(row['id'], a['turn_id'], c, time.time())
+                reason = (eligibility(a, c, time.time())
+                          or ledger.reason(row['id'], a['turn_id'], c, time.time()))
                 entry = dict(thread_id=row['id'], context_tokens=a['context_tokens'],
                              idle_seconds=round(time.time() - a['last_activity']),
+                             cache_age_seconds=round(time.time() - a['usage_timestamp']),
                              decision=reason or 'candidate-needs-live-check')
                 if not reason:
                     if execute:
                         entry = run_compaction(row, a, c, root, home, app, ledger,
-                                               automatic=thread_id is None, allow_cold=allow_cold)
+                                               automatic=thread_id is None)
                     else:
                         with Desktop(home, app) as desktop:
                             state = desktop.snapshot(row['id'])
@@ -617,7 +652,8 @@ def launch_agent(args, remove=False):
 
 
 def config_contract():
-    return DEFAULTS['enabled'] is False and DEFAULTS['max_per_day'] == 50 and DEFAULTS['max_per_month'] is None
+    return (DEFAULTS['enabled'] is False and DEFAULTS['max_per_day'] == 50
+            and DEFAULTS['max_per_month'] is None and 'cooldown_seconds' not in DEFAULTS)
 
 def monthly_cap(value):
     if value.lower() in ('none', 'null'):
@@ -640,7 +676,6 @@ def main():
         subs.add_parser(name)
     p = subs.add_parser('compact', help='One explicit, manually invoked compaction of an eligible task')
     p.add_argument('thread_id')
-    p.add_argument('--allow-cold', action='store_true', help='Allow this one idle task after the normal 29-minute window; its cache may be cold')
     p = subs.add_parser('enable', help='Approve recurring metered compactions with explicit attempt caps')
     p.add_argument('--accept-metered-compaction', action='store_true', required=True)
     p.add_argument('--max-per-day', type=int, required=True)
@@ -665,7 +700,7 @@ def main():
             c.update(enabled=False, metered_automation_approved=False)
         atomic_json(args.state/'config.json', c)
         print(json.dumps({'enabled': c['enabled'], 'max_per_day': c['max_per_day'],
-                          'max_per_month': c['max_per_month']}))
+                          'max_per_month': c['max_per_month'], 'compaction': dispatch_policy()}))
         return
     if args.command == 'install':
         subprocess.run([sys.executable,str(Path(__file__).parent/'install.py'),'--state',str(args.state)],check=True)
@@ -678,7 +713,7 @@ def main():
         with Desktop(args.codex_home, args.app):
             pass
         print(json.dumps(dict(app_version=version, ipc='connected', supported_scope='local Codex-backed tasks',
-                              automatic_enabled=config_read(args.state)['enabled'])))
+                              automatic_enabled=config_read(args.state)['enabled'], compaction=dispatch_policy())))
         return
     if args.command == 'metrics':
         ledger = Ledger(args.state)
@@ -691,7 +726,7 @@ def main():
         c = config_read(args.state)
         ledger = Ledger(args.state)
         try:
-            print(json.dumps(dict(config=c, attempts=ledger.summary()), indent=2))
+            print(json.dumps(dict(config=c, attempts=ledger.summary(), compaction=dispatch_policy()), indent=2))
         finally:
             ledger.close()
         return
@@ -719,10 +754,12 @@ def main():
                     out = scan(args.state, args.codex_home, args.app,
                                execute=c['enabled'] and c['metered_automation_approved'])
                     atomic_json(args.state/'latest-plan.json', dict(at=time.time(), decisions=out))
-                    atomic_json(args.state/'worker-health.json',dict(at=time.time(),version=VERSION,status='running'))
+                    atomic_json(args.state/'worker-health.json',dict(at=time.time(),version=VERSION,status='running',
+                                                                   compaction=dispatch_policy()))
                     # Only aggregate changes on stdout; no transcript content or titles.
                     summary = json.dumps(dict(eligible=sum(x.get('decision')=='eligible' for x in out),
-                                              automatic=c['enabled'], outcomes=[x.get('status') for x in out if x.get('status')]))
+                                              automatic=c['enabled'], compaction=dispatch_policy(),
+                                              outcomes=[x.get('status') for x in out if x.get('status')]))
                     if summary != last:
                         print(summary, flush=True)
                         last = summary
@@ -735,8 +772,7 @@ def main():
                 time.sleep(interval)
         else:
             out = scan(args.state, args.codex_home, args.app,
-                       execute=args.command in ('once', 'compact'), thread_id=getattr(args, 'thread_id', None),
-                       allow_cold=getattr(args, 'allow_cold', False))
+                       execute=args.command in ('once', 'compact'), thread_id=getattr(args, 'thread_id', None))
             print(json.dumps(out, indent=2))
 
 if __name__ == '__main__':
