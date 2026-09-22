@@ -13,7 +13,7 @@ import sys
 import time
 import updater as u
 
-VERSION='0.2.3'
+VERSION='0.2.4'
 
 def check(root,force=False):
     status=u.read_json(root/'update-status.json')
@@ -26,6 +26,7 @@ def check(root,force=False):
         candidate=u.stage(root,raw,(root/'release-public.pem').read_text())
         status.update(status='staged' if candidate else 'current',error=None)
         if candidate:status['available_version']=candidate['version']
+        else:status.pop('available_version',None)
         u.save(root/'update-status.json',status)
         return candidate
     except Exception as e:
@@ -76,7 +77,7 @@ def serve(root):
                     started=time.time()
                     worker=subprocess.Popen(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                 health=u.read_json(root/'worker-health.json')
-                if health.get('version')==VERSION and health.get('at',0)>=started and time.time()-started>=45:
+                if health.get('version')==VERSION and health.get('at',0)>=started and time.time()-started>=45 and health.get('status') in ('running','compatibility-blocked'):
                     active=u.read_json(root/'active.json')
                     if active.get('current')==VERSION and active.get('last_good')!=VERSION:
                         active['last_good']=VERSION;u.save(root/'active.json',active);u.cleanup(root)

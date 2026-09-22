@@ -185,6 +185,18 @@ class Tests(unittest.TestCase):
             m.atomic_json(self.config_root/'config.json',{**m.DEFAULTS,**update})
             with self.assertRaises(m.GuardError):m.config_read(self.config_root)
 
+    def test_watch_publishes_liveness_before_a_slow_first_scan(self):
+        def scan(*args,**kwargs):
+            health=json.loads((self.config_root/'worker-health.json').read_text())
+            self.assertEqual(health['status'],'scanning')
+            self.assertEqual(health['version'],m.VERSION)
+            (self.config_root/'restart-request').touch()
+            return []
+        argv=['idle_compactor.py','--state',str(self.config_root),'watch']
+        with patch.object(m.sys,'argv',argv),patch.object(m,'scan',side_effect=scan),contextlib.redirect_stdout(io.StringIO()):
+            m.main()
+        self.assertEqual(json.loads((self.config_root/'worker-health.json').read_text())['status'],'running')
+
     def test_future_build_accepted_by_capabilities(self):
         p=self.app/'Contents/Info.plist';x=plistlib.loads(p.read_bytes());x['CFBundleVersion']='future'
         p.write_bytes(plistlib.dumps(x))

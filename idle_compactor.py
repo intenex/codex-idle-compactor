@@ -23,7 +23,7 @@ import time
 import uuid
 import compatibility
 
-VERSION = '0.2.3'
+VERSION = '0.2.4'
 FRAME_LIMIT = 32 * 1024 * 1024
 TAIL_LIMIT = 16 * 1024 * 1024
 DEFAULTS = dict(enabled=False, idle_seconds=1500, latest_start_seconds=1740,
@@ -712,6 +712,10 @@ def main():
                 try:
                     c = config_read(args.state)
                     interval = c['poll_seconds']
+                    # A first scan may include a slow native compaction. Publish
+                    # liveness before it so the supervisor does not mistake that
+                    # legitimate work for a worker that never started.
+                    atomic_json(args.state/'worker-health.json',dict(at=time.time(),version=VERSION,status='scanning'))
                     out = scan(args.state, args.codex_home, args.app,
                                execute=c['enabled'] and c['metered_automation_approved'])
                     atomic_json(args.state/'latest-plan.json', dict(at=time.time(), decisions=out))

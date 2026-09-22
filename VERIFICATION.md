@@ -16,7 +16,7 @@ No claim is made that compaction always saves tokens or that private app interfa
 
 ## Live evidence on 2026-09-22
 
-- 52 automated tests pass, including the 50/day limit, no monthly ceiling, persistence across restarts, pause, signed updates, failed signatures, rollback, installation timing, and late-completion reconciliation.
+- 53 automated tests pass, including the 50/day limit, no monthly ceiling, persistence across restarts, pause, signed updates, failed signatures, rollback, installation timing, liveness before a slow first scan, and late-completion reconciliation.
 - Published signed releases to the public GitHub feed and observed the installed background service upgrade itself from 0.2.0 to 0.2.1. The previously configured limits stayed unchanged until the explicit owner request was applied.
 - Active owner configuration: enabled, 50 attempts/day (UTC), no monthly cap, context range 1,024–1,000,000 tokens. Account billing and plan were not changed.
 - One explicitly requested manual live compaction of an already idle, app-owned task completed. Completion was verified from the persisted compaction marker, not merely the IPC acknowledgement.
