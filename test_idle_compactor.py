@@ -128,6 +128,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.ledger.reason('thread-1','turn-2',self.c,NOW),'per-task-cooldown')
 
     def test_limits_and_restart(self):
+        self.c.update(max_per_day=2,max_per_month=20)
         for i in range(2):
             aid=self.ledger.reserve({'id':str(i)},{**self.a,'turn_id':str(i)},self.c,NOW)
             self.ledger.status(aid,'completed')
@@ -135,6 +136,29 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.ledger.reason('third','third',self.c,NOW),'daily-cap')
         c={**self.c,'max_per_day':10,'max_per_month':2}
         self.assertEqual(self.ledger.reason('third','third',c,NOW),'monthly-cap')
+
+    def test_fifty_daily_and_no_monthly_cap_survive_restart(self):
+        c={**self.c,'max_per_day':50,'max_per_month':None}
+        # Previous days in the same month do not impose a hidden monthly ceiling.
+        for i in reversed(range(55)):
+            aid=self.ledger.reserve({'id':'older'+str(i)},self.a,c,NOW-86400*(1+i//50))
+            self.ledger.status(aid,'completed')
+        for i in range(50):
+            aid=self.ledger.reserve({'id':'today'+str(i)},self.a,c,NOW)
+            self.ledger.status(aid,'completed')
+        self.ledger.close();self.ledger=m.Ledger(self.config_root)
+        self.assertEqual(self.ledger.reason('next','next',c,NOW),'daily-cap')
+        self.assertIsNone(self.ledger.reason('next','next',c,NOW+86400))
+
+    def test_monthly_cap_optional_and_validated(self):
+        for value in (None,1,5000):
+            m.atomic_json(self.config_root/'config.json',{**m.DEFAULTS,'max_per_month':value})
+            self.assertEqual(m.config_read(self.config_root)['max_per_month'],value)
+        for value in (0,-1,True,'none'):
+            m.atomic_json(self.config_root/'config.json',{**m.DEFAULTS,'max_per_month':value})
+            with self.assertRaises(m.GuardError):m.config_read(self.config_root)
+        self.assertIsNone(m.monthly_cap('none'))
+        self.assertEqual(m.monthly_cap('20'),20)
 
     def test_single_instance_lock(self):
         with m.exclusive(self.config_root):

@@ -23,12 +23,12 @@ import time
 import uuid
 import compatibility
 
-VERSION = '0.2.0'
+VERSION = '0.2.1'
 FRAME_LIMIT = 32 * 1024 * 1024
 TAIL_LIMIT = 16 * 1024 * 1024
 DEFAULTS = dict(enabled=False, idle_seconds=1500, latest_start_seconds=1740,
                 min_context_tokens=50000, max_context_tokens=180000,
-                max_per_day=2, max_per_month=20, cooldown_seconds=86400,
+                max_per_day=50, max_per_month=None, cooldown_seconds=86400,
                 poll_seconds=30, exclude_threads=[], allow_threads=[],
                 metered_automation_approved=False)
 LABEL = 'local.codex-idle-compactor'
@@ -70,7 +70,7 @@ def config_read(root):
     c = dict(DEFAULTS)
     c.update(json.loads(path.read_text()))
     for name in ('idle_seconds', 'latest_start_seconds', 'min_context_tokens',
-                 'max_context_tokens', 'max_per_day', 'max_per_month',
+                 'max_context_tokens', 'max_per_day',
                  'cooldown_seconds', 'poll_seconds'):
         if type(c[name]) is not int or c[name] <= 0:
             raise GuardError('Invalid positive integer setting: ' + name)
@@ -78,8 +78,10 @@ def config_read(root):
         raise GuardError('Idle window must end before 30 minutes')
     if c['poll_seconds'] < 10 or c['min_context_tokens'] > c['max_context_tokens']:
         raise GuardError('Invalid polling interval or context range')
-    if c['max_per_day'] > 10 or c['max_per_month'] > 100:
-        raise GuardError('Pilot hard ceiling is 10/day and 100/month')
+    if c['max_per_day'] > 50:
+        raise GuardError('Daily attempt ceiling is 50')
+    if c['max_per_month'] is not None and (type(c['max_per_month']) is not int or c['max_per_month'] <= 0):
+        raise GuardError('Monthly cap must be a positive integer or null for no cap')
     if c['cooldown_seconds'] < 3600:
         raise GuardError('Minimum per-task cooldown is one hour')
     for name in ('enabled', 'metered_automation_approved'):
@@ -396,6 +398,8 @@ class Ledger:
         month = utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
         for start, cap, label in [(day, c['max_per_day'], 'daily-cap'),
                                   (month, c['max_per_month'], 'monthly-cap')]:
+            if cap is None:
+                continue
             count = self.db.execute('SELECT count(*) FROM attempts WHERE started>=?', (start,)).fetchone()[0]
             if count >= cap:
                 return label
@@ -606,7 +610,18 @@ def launch_agent(args, remove=False):
 
 
 def config_contract():
-    return DEFAULTS['enabled'] is False and DEFAULTS['max_per_day'] == 2 and DEFAULTS['max_per_month'] == 20
+    return DEFAULTS['enabled'] is False and DEFAULTS['max_per_day'] == 50 and DEFAULTS['max_per_month'] is None
+
+def monthly_cap(value):
+    if value.lower() in ('none', 'null'):
+        return None
+    try:
+        cap = int(value)
+        if cap > 0:
+            return cap
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError('Use a positive integer or none')
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -621,7 +636,7 @@ def main():
     p = subs.add_parser('enable', help='Approve recurring metered compactions with explicit attempt caps')
     p.add_argument('--accept-metered-compaction', action='store_true', required=True)
     p.add_argument('--max-per-day', type=int, required=True)
-    p.add_argument('--max-per-month', type=int, required=True)
+    p.add_argument('--max-per-month', type=monthly_cap, required=True)
     args = parser.parse_args()
     for name in ('state', 'codex_home', 'app'):
         setattr(args, name, getattr(args, name).expanduser().resolve())
@@ -634,8 +649,8 @@ def main():
         # Settings remain mutable while the watcher holds its execution lock.
         c = config_read(args.state)
         if args.command == 'enable':
-            if not 1 <= args.max_per_day <= 10 or not 1 <= args.max_per_month <= 100:
-                raise GuardError('Caps must be 1..10/day and 1..100/month')
+            if not 1 <= args.max_per_day <= 50:
+                raise GuardError('Daily cap must be 1..50')
             c.update(enabled=True, metered_automation_approved=True,
                      max_per_day=args.max_per_day, max_per_month=args.max_per_month)
         else:

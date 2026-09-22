@@ -12,15 +12,33 @@ import subprocess
 import sys
 import time
 import updater as u
+from idle_compactor import monthly_cap
 
 LABEL='local.codex-idle-compactor'
+
+def load_service(domain, path):
+    target=domain+'/'+LABEL
+    subprocess.run(['launchctl','bootout',target],capture_output=True)
+    # bootout can return before launchd has finished removing the old service.
+    deadline=time.monotonic()+30
+    while subprocess.run(['launchctl','print',target],capture_output=True).returncode==0:
+        if time.monotonic()>=deadline:
+            raise u.UpdateError('Previous background service did not unload')
+        time.sleep(1)
+    for attempt in range(5):
+        result=subprocess.run(['launchctl','bootstrap',domain,str(path)],capture_output=True,text=True)
+        if result.returncode==0:return
+        # A delayed successful registration must not be installed twice.
+        if subprocess.run(['launchctl','print',target],capture_output=True).returncode==0:return
+        if attempt<4:time.sleep(2)
+    raise u.UpdateError('Background service could not start: '+result.stderr.strip()[:300])
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--state',type=Path,default=Path.home()/'Library/Application Support/Codex Idle Compactor')
     modes=p.add_mutually_exclusive_group()
     modes.add_argument('--enable',action='store_true');modes.add_argument('--observe',action='store_true')
-    p.add_argument('--max-per-day',type=int,default=2);p.add_argument('--max-per-month',type=int,default=20)
+    p.add_argument('--max-per-day',type=int,default=50);p.add_argument('--max-per-month',type=monthly_cap,default=None)
     p.add_argument('--codex-home',type=Path,default=Path(os.environ.get('CODEX_HOME',str(Path.home()/'.codex'))))
     a=p.parse_args();root=a.state.expanduser().resolve()
     if sys.platform!='darwin':raise SystemExit('This installer supports macOS only.')
@@ -42,7 +60,7 @@ def main():
         # Activation is explicit. Retention of an existing config never silently
         # enlarges an approved cap during an automatic update.
         subprocess.run(control+['enable','--accept-metered-compaction','--max-per-day',str(a.max_per_day),
-                               '--max-per-month',str(a.max_per_month)],check=True)
+                               '--max-per-month',str(a.max_per_month) if a.max_per_month is not None else 'none'],check=True)
     elif a.observe:
         subprocess.run(control+['pause'],check=True)
     else:
@@ -55,12 +73,11 @@ def main():
         if time.monotonic()>=deadline:raise u.UpdateError('An earlier compaction is unresolved; reconcile before installing')
         time.sleep(1)
     domain='gui/'+str(os.getuid())
-    subprocess.run(['launchctl','bootout',domain+'/'+LABEL],capture_output=True)
     path=Path.home()/'Library/LaunchAgents'/(LABEL+'.plist');path.parent.mkdir(parents=True,exist_ok=True)
     spec=dict(Label=LABEL,ProgramArguments=[sys.executable,str(root/'boot.py')],RunAtLoad=True,
               KeepAlive=True,ThrottleInterval=30,ProcessType='Background',ExitTimeOut=10)
     tmp=path.with_suffix('.tmp');tmp.write_bytes(plistlib.dumps(spec));tmp.chmod(0o600);os.replace(tmp,path)
-    subprocess.run(['launchctl','bootstrap',domain,str(path)],check=True,capture_output=True)
+    load_service(domain,path)
     print('Installed '+active['current']+'. Signed updates check every 30 minutes. Settings and attempt ledger preserved.')
 
 if __name__=='__main__':main()

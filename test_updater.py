@@ -129,3 +129,23 @@ class Updates(unittest.TestCase):
             self.assertIsNone(u.stage(self.root,self.manifest(),self.public,download));download.assert_not_called()
 
 if __name__=='__main__':unittest.main()
+
+
+class InstallerTests(unittest.TestCase):
+    def test_launchd_registration_race_retries(self):
+        import install
+        from types import SimpleNamespace
+        responses=[SimpleNamespace(returncode=0),SimpleNamespace(returncode=0),
+                   SimpleNamespace(returncode=1),SimpleNamespace(returncode=5,stderr='Input/output error'),
+                   SimpleNamespace(returncode=1),SimpleNamespace(returncode=0)]
+        with patch.object(install.subprocess,'run',side_effect=responses) as run, patch.object(install.time,'sleep'):
+            install.load_service('gui/501',Path('/tmp/test.plist'))
+        self.assertEqual(sum(c.args[0][1]=='bootstrap' for c in run.call_args_list),2)
+
+    def test_launchd_failure_is_not_success(self):
+        import install
+        from types import SimpleNamespace
+        def result(cmd,**kwargs):
+            return SimpleNamespace(returncode=5,stderr='fixture rejected')
+        with patch.object(install.subprocess,'run',side_effect=result), patch.object(install.time,'sleep'):
+            with self.assertRaises(u.UpdateError):install.load_service('gui/501',Path('/tmp/test.plist'))

@@ -8,7 +8,7 @@ No third-party utility can guarantee that every future private interface will ke
 
 ## Install
 
-Download [the latest ZIP](https://github.com/intenex/codex-idle-compactor/releases/latest/download/idle-compactor.zip), unzip it, and open **Install.command**. This enables the capped pilot described below and automatic updates. Alternatively, open **Install Observation.command** for a monitor that makes no compaction calls. Python 3.9+ is required; no third-party Python packages are needed.
+Download [the latest ZIP](https://github.com/intenex/codex-idle-compactor/releases/latest/download/idle-compactor.zip), unzip it, and open **Install.command**. This enables the 50-attempts-per-day policy described below and automatic updates. Alternatively, open **Install Observation.command** for a monitor that makes no compaction calls. Python 3.9+ is required; no third-party Python packages are needed.
 
 The installer copies the signed release into `~/Library/Application Support/Codex Idle Compactor/` and installs a LaunchAgent that runs at login. The download folder can then be removed. The updater starts even if ChatGPT/Codex is closed or the currently installed app is incompatible.
 
@@ -38,7 +38,7 @@ Updates come from public GitHub releases. There is no hosted worker, paid update
 | Latest dispatch | Before 29 minutes of inactivity |
 | Context estimate | 50,000–180,000 tokens from the most recent request |
 | Per-task cooldown | 24 hours |
-| Global attempts | 2/day and 20/calendar month, UTC |
+| Global attempts | 50/day (UTC); no monthly cap |
 | Repeated cache warming | None |
 | Ambiguous completion | No retry; block new attempts pending reconciliation |
 
@@ -55,7 +55,7 @@ python3 control.py status
 python3 control.py update-status
 python3 control.py update
 python3 control.py pause
-python3 control.py enable --accept-metered-compaction --max-per-day 2 --max-per-month 20
+python3 control.py enable --accept-metered-compaction --max-per-day 50 --max-per-month none
 python3 control.py metrics
 python3 control.py reconcile
 python3 control.py uninstall

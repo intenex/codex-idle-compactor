@@ -13,7 +13,7 @@ import sys
 import time
 import updater as u
 
-VERSION='0.2.0'
+VERSION='0.2.1'
 
 def check(root,force=False):
     status=u.read_json(root/'update-status.json')
@@ -101,7 +101,8 @@ def main():
         (root/'check-update-now').touch(mode=0o600)
         print('Update check requested; the running supervisor will perform it.')
     else:print(json.dumps(dict(release=u.read_json(root/'active.json'),updates=u.read_json(root/'update-status.json'),
-                             supervisor=u.read_json(root/'supervisor-health.json')),indent=2))
+                             supervisor=u.read_json(root/'supervisor-health.json'),
+                             worker=u.read_json(root/'worker-health.json')),indent=2))
 
 if __name__=='__main__':
     signal.signal(signal.SIGTERM,lambda *_:sys.exit(0))
