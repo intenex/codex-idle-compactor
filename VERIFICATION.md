@@ -14,7 +14,15 @@ Fixtures spanning multiple protocol/build shapes are not real execution tests of
 
 No claim is made that compaction always saves tokens or that private app interfaces cannot break. The updater remains separate from those interfaces so a signed fix can be delivered after a break. An uncertain already-dispatched model operation may still require manual reconciliation before compaction resumes.
 
-## Current policy: 0.2.5
+## Current policy: 0.2.6
+
+- 70 automated tests pass. The default trigger is 1,200 seconds and dispatch cutoff is 1,500 seconds. Boundary checks cover 19:59, 20:00, 24:59, 25:00 and later, including slow preflight/reservation and final transport checks on a real Unix socket with a simulated desktop. Tests make no model calls.
+- The exact previous default 25/29-minute window migrates on read to 20/25. Tests verify custom windows, pause/approval, exclusions, daily/monthly settings, and attempt accounting are preserved.
+- Timing settings and usage timestamp are saved transactionally with each new reservation. Cache counters, cached fraction, completion duration, and first resumed-request usage are saved locally when observed. Historical usage/ages are backfilled where available, without inventing old policy/version metadata.
+- Tests cover durable observations after restart, transcript truncation/removal, response deduplication, incremental resume capture, protection against later compaction markers replacing saved evidence, unknown/invalid counters, bounded/throttled background collection, and passive collection when app compatibility is blocked. No prompts or responses are copied into observations; no new hosted or model job is added.
+- All prior guards and signed-update tests continue to pass. Local operation was set to 20/25 with 50/day, no monthly cap, and no cooldown. Signed deployment results will be recorded after publication.
+
+## Historical policy: 0.2.5
 
 - 62 automated tests pass. Added checks cover repeated completed turns in the same task without a cooldown, migration of old cooldown settings, rejection of the removed cold override, and the retained 50/day cap with no monthly cap. Missing, non-finite, and future usage timestamps cannot dispatch.
 - Timing is measured from the latest recorded model usage, not later bookkeeping. Duplicated response IDs and unchanged legacy usage reports do not refresh that clock. The app does not expose the actual cache-write/reuse timestamp, so this remains a proxy.

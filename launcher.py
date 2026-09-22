@@ -13,7 +13,7 @@ import sys
 import time
 import updater as u
 
-VERSION='0.2.5'
+VERSION='0.2.6'
 
 def check(root,force=False):
     status=u.read_json(root/'update-status.json')

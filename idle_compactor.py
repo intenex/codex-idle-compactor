@@ -24,10 +24,10 @@ import time
 import uuid
 import compatibility
 
-VERSION = '0.2.5'
+VERSION = '0.2.6'
 FRAME_LIMIT = 32 * 1024 * 1024
 TAIL_LIMIT = 16 * 1024 * 1024
-DEFAULTS = dict(enabled=False, idle_seconds=1500, latest_start_seconds=1740,
+DEFAULTS = dict(enabled=False, idle_seconds=1200, latest_start_seconds=1500,
                 min_context_tokens=1024, max_context_tokens=1000000,
                 max_per_day=50, max_per_month=None,
                 poll_seconds=30, exclude_threads=[], allow_threads=[],
@@ -52,7 +52,7 @@ def cache_window_reason(usage_timestamp, c, now):
     if not usage_timestamp or age < c['idle_seconds']:
         return 'not-idle-long-enough'
     # A final transport check also enforces the hard 30-minute ceiling even if
-    # called with an unchecked configuration. Normal config ends at 29 minutes.
+    # called with an unchecked configuration. Normal config ends at 25 minutes.
     if age >= min(c['latest_start_seconds'], 1800):
         return 'missed-cache-window'
     return None
@@ -90,6 +90,11 @@ def config_read(root):
         atomic_json(path, DEFAULTS)
     c = dict(DEFAULTS)
     c.update(json.loads(path.read_text()))
+    # Migrate the previous release defaults on read, without racing a concurrent
+    # pause/settings write. The next explicit settings write persists this pair.
+    # Keep deliberately customized windows and all approval/limit settings.
+    if (c['idle_seconds'], c['latest_start_seconds']) == (1500, 1740):
+        c.update(idle_seconds=1200, latest_start_seconds=1500)
     # Retired usage guard: old installations must not retain a hidden cooldown.
     c.pop('cooldown_seconds', None)
     for name in ('idle_seconds', 'latest_start_seconds', 'min_context_tokens',
@@ -414,6 +419,13 @@ class Ledger:
             started REAL NOT NULL, status TEXT NOT NULL, context_tokens INTEGER NOT NULL,
             before_compacted REAL NOT NULL, finished REAL,
             UNIQUE(thread_id, turn_id))''')
+        # Additive tables keep older releases able to read the attempt ledger.
+        self.db.execute('''CREATE TABLE IF NOT EXISTS attempt_timing (
+            attempt_id INTEGER PRIMARY KEY, usage_timestamp REAL NOT NULL,
+            trigger_seconds INTEGER NOT NULL, cutoff_seconds INTEGER NOT NULL,
+            utility_version TEXT NOT NULL)''')
+        self.db.execute('''CREATE TABLE IF NOT EXISTS attempt_observations (
+            attempt_id INTEGER PRIMARY KEY, data TEXT NOT NULL, checked_at REAL NOT NULL)''')
         self.db.commit()
 
     def reason(self, thread_id, turn_id, c, now):
@@ -445,6 +457,9 @@ class Ledger:
                 (thread_id,turn_id,started,status,context_tokens,before_compacted)
                 VALUES(?,?,?,'reserved',?,?)''',
                 (row['id'], a['turn_id'], now, a['context_tokens'], a['compacted']))
+            self.db.execute('INSERT INTO attempt_timing VALUES(?,?,?,?,?)',
+                            (cur.lastrowid, a['usage_timestamp'], c['idle_seconds'],
+                             c['latest_start_seconds'], VERSION))
         return cur.lastrowid
 
     def status(self, attempt, status):
@@ -569,53 +584,135 @@ def scan(root, home, app, execute=False, thread_id=None):
 
 
 
-def measurement(home, ledger):
-    """Observed usage only. Missing compaction usage stays null, never zero."""
-    result = []
-    for aid, tid, started, status, context in ledger.db.execute(
-            'SELECT id,thread_id,started,status,context_tokens FROM attempts ORDER BY id'):
-        out = dict(attempt=aid, thread_id=tid, status=status, context_before=context,
-                   compaction_usage=None, first_resume_usage=None)
-        rows = list(candidates(home, time.time(), tid))
-        if not rows:
-            result.append(out)
+def usage_counters(usage):
+    """Only validated scalar counters; an unknown required counter is not zero."""
+    if not isinstance(usage, dict):
+        return None
+    safe = {k: usage.get(k) for k in ('input_tokens', 'cached_input_tokens', 'output_tokens')}
+    safe['cache_write_input_tokens'] = usage.get('cache_write_input_tokens', 0)
+    if any(type(v) is not int or v < 0 for v in safe.values()):
+        return None
+    if safe['cached_input_tokens'] + safe['cache_write_input_tokens'] > safe['input_tokens']:
+        return None
+    safe['noncached_input_tokens'] = safe['input_tokens'] - safe['cached_input_tokens']
+    safe['cached_input_fraction'] = (safe['cached_input_tokens'] / safe['input_tokens']
+                                     if safe['input_tokens'] else None)
+    return safe
+
+
+def observe_records(records, started, known_compacted=None):
+    """Inspect existing records only; never trigger model work to fill a metric."""
+    out = {}
+    compacted = known_compacted if known_compacted is not None else next(
+        (timestamp(r.get('timestamp')) for r in records
+         if r.get('type') == 'compacted' and timestamp(r.get('timestamp')) >= started), None)
+    marker_present = any(r.get('type') == 'compacted' and timestamp(r.get('timestamp')) == compacted
+                         for r in records)
+    sums = dict(input_tokens=0, cached_input_tokens=0, cache_write_input_tokens=0, output_tokens=0)
+    seen = set()
+    count = 0
+    invalid_compaction_usage = False
+    user_resumed = resume_seen = False
+    previous_usage = 0
+    for r in records:
+        when, p = timestamp(r.get('timestamp')), r.get('payload', {})
+        if not isinstance(p, dict):
             continue
-        records = read_tail(rows[0]['path'])
-        compacted = next((timestamp(r.get('timestamp')) for r in records
-                          if r.get('type') == 'compacted' and timestamp(r.get('timestamp')) >= started), None)
-        if compacted is None:
-            result.append(out)
+        if compacted is not None and r.get('type') == 'response_item' and p.get('role') == 'user' and when > compacted:
+            user_resumed = True
+        if r.get('type') != 'token_usage_record':
             continue
-        sums = dict(input_tokens=0, cached_input_tokens=0, cache_write_input_tokens=0, output_tokens=0)
-        seen = set()
-        count = 0
-        user_resumed = False
-        for r in records:
-            when, p = timestamp(r.get('timestamp')), r.get('payload', {})
-            if not isinstance(p, dict):
-                continue
-            if r.get('type') == 'response_item' and p.get('role') == 'user' and when > compacted:
-                user_resumed = True
-            if r.get('type') != 'token_usage_record':
-                continue
-            key = p.get('response_id') or (when, p.get('turn_id'))
-            if key in seen:
-                continue
-            seen.add(key)
-            u = p.get('usage', {})
-            safe = {k: u.get(k, 0) for k in sums}
-            safe['noncached_input_tokens'] = max(0, safe['input_tokens'] - safe['cached_input_tokens'])
-            if started <= when <= compacted:
+        key = p.get('response_id') or (when, p.get('turn_id'))
+        if key in seen:
+            continue
+        seen.add(key)
+        if 0 < when < started and math.isfinite(when):
+            previous_usage = max(previous_usage, when)
+        safe = usage_counters(p.get('usage'))
+        if compacted is not None and started <= when <= compacted:
+            if safe is None:
+                invalid_compaction_usage = True
+            else:
                 for k in sums:
                     sums[k] += safe[k]
                 count += 1
-            elif when > compacted and user_resumed and out['first_resume_usage'] is None:
+        elif marker_present and when > compacted and user_resumed and not resume_seen:
+            resume_seen = True
+            if safe is not None:
                 out['first_resume_usage'] = safe
-        if count:
-            sums['noncached_input_tokens'] = max(0, sums['input_tokens'] - sums['cached_input_tokens'])
-            out['compaction_usage'] = sums
+    if previous_usage:
+        out['cache_age_seconds'] = round(started - previous_usage, 3)
+    if compacted is not None:
+        out['compacted_at'] = compacted
+        out['compaction_duration_seconds'] = round(compacted - started, 3)
+    if count and not invalid_compaction_usage:
+        out['compaction_usage'] = usage_counters(sums)
+    return out
+
+
+def measurement(home, ledger, refresh_limit=None):
+    """Persist metadata locally. Missing usage stays null; known values survive
+    transcript truncation, archival and restarts. Watcher reads are bounded and
+    throttled; a manual metrics command can refresh every incomplete attempt.
+    """
+    now = time.time()
+    attempts = ledger.db.execute('''SELECT a.id,a.thread_id,a.started,a.status,a.context_tokens,
+        t.usage_timestamp,t.trigger_seconds,t.cutoff_seconds,t.utility_version,o.data,o.checked_at
+        FROM attempts a LEFT JOIN attempt_timing t ON a.id=t.attempt_id
+        LEFT JOIN attempt_observations o ON a.id=o.attempt_id
+        ORDER BY COALESCE(o.checked_at,0),a.id DESC''').fetchall()
+    result = []
+    refreshed = 0
+    for aid, tid, started, status, context, usage_time, trigger, cutoff, version, data, checked in attempts:
+        out = dict(attempt=aid, thread_id=tid, status=status, context_before=context,
+                   started_at=started, cache_age_seconds=None, compacted_at=None, compaction_duration_seconds=None,
+                   configured_trigger_seconds=trigger, configured_cutoff_seconds=cutoff,
+                   utility_version=version, compaction_usage=None, first_resume_usage=None)
+        if data:
+            out.update(json.loads(data))
+        out['status'] = status
+        complete = out['compaction_usage'] is not None and out['first_resume_usage'] is not None
+        refresh = not complete and status != 'skipped-no-dispatch'
+        if refresh_limit is not None:
+            refresh = (refresh and refreshed < refresh_limit and now - started <= 30 * 86400
+                       and (checked is None or now - checked >= 300))
+        if refresh:
+            refreshed += 1
+            try:
+                rows = list(candidates(home, now, tid))
+                if rows:
+                    observed = observe_records(read_tail(rows[0]['path']), started, out['compacted_at'])
+                    for key, value in observed.items():
+                        if out.get(key) is None:
+                            out[key] = value
+            except (GuardError, OSError, ValueError, KeyError, TypeError):
+                pass  # Keep previously observed counters; do not invent missing data.
+            # Reservation metadata is authoritative for new attempts. Historical
+            # ages can be reconstructed, but their configured policy stays unknown.
+            if usage_time is not None:
+                out['cache_age_seconds'] = round(started - usage_time, 3)
+            with ledger.db:
+                ledger.db.execute('BEGIN IMMEDIATE')
+                # A concurrent manual report must not erase a value that the
+                # watcher just observed (or vice versa).
+                saved = ledger.db.execute('SELECT data FROM attempt_observations WHERE attempt_id=?', (aid,)).fetchone()
+                if saved:
+                    for key, value in json.loads(saved[0]).items():
+                        if value is not None and key != 'status':
+                            out[key] = value
+                ledger.db.execute('''INSERT INTO attempt_observations VALUES(?,?,?)
+                    ON CONFLICT(attempt_id) DO UPDATE SET data=excluded.data,checked_at=excluded.checked_at''',
+                    (aid, json.dumps(out), now))
         result.append(out)
-    return result
+    return sorted(result, key=lambda x: x['attempt'])
+
+
+def collect_measurements(root, home):
+    ledger = Ledger(root)
+    try:
+        measurement(home, ledger, refresh_limit=4)
+    finally:
+        ledger.close()
 
 
 def launch_agent(args, remove=False):
@@ -653,7 +750,8 @@ def launch_agent(args, remove=False):
 
 def config_contract():
     return (DEFAULTS['enabled'] is False and DEFAULTS['max_per_day'] == 50
-            and DEFAULTS['max_per_month'] is None and 'cooldown_seconds' not in DEFAULTS)
+            and DEFAULTS['max_per_month'] is None and 'cooldown_seconds' not in DEFAULTS
+            and (DEFAULTS['idle_seconds'], DEFAULTS['latest_start_seconds']) == (1200, 1500))
 
 def monthly_cap(value):
     if value.lower() in ('none', 'null'):
@@ -767,6 +865,12 @@ def main():
                     error = str(e) if isinstance(e, GuardError) else type(e).__name__
                     atomic_json(args.state/'worker-health.json',dict(at=time.time(),version=VERSION,status='compatibility-blocked',error=error))
                     print(json.dumps({'watcher_error': error, 'calls_blocked': True}), flush=True)
+                # Keep passive observations even when compaction is paused or
+                # app compatibility is blocked. No IPC or model call is made.
+                try:
+                    collect_measurements(args.state, args.codex_home)
+                except Exception as e:
+                    print(json.dumps({'metrics_error': type(e).__name__}), flush=True)
                 if (args.state/'restart-request').exists():
                     return
                 time.sleep(interval)

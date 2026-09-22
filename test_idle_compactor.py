@@ -24,13 +24,13 @@ def row(typ, payload, when):
                 timestamp=dt.datetime.fromtimestamp(when, dt.timezone.utc).isoformat())
 
 def records(now=NOW):
-    return [row('event_msg', {'type':'task_started','turn_id':'turn-1'}, now-1600),
-            row('response_item', {'type':'message','role':'user','content':'PRIVATE'}, now-1590),
+    return [row('event_msg', {'type':'task_started','turn_id':'turn-1'}, now-1300),
+            row('response_item', {'type':'message','role':'user','content':'PRIVATE'}, now-1290),
             row('token_usage_record', {'usage':{'input_tokens':60000,'cached_input_tokens':59000,
-                    'output_tokens':1000}}, now-1530),
+                    'output_tokens':1000}}, now-1230),
             row('event_msg', {'type':'token_count','info':{'last_token_usage':{
-                'input_tokens':90000,'output_tokens':1000}}}, now-1525),
-            row('event_msg', {'type':'task_complete','turn_id':'turn-1'}, now-1510)]
+                'input_tokens':90000,'output_tokens':1000}}}, now-1225),
+            row('event_msg', {'type':'task_complete','turn_id':'turn-1'}, now-1210)]
 
 def state(a, tid='thread-1'):
     return dict(id=tid, hostId='local', resumeState='resumed', requests=[],
@@ -86,13 +86,13 @@ class Tests(unittest.TestCase):
         self.assertEqual(m.activity(self.file)['context_tokens'],91000)
 
     def test_running_and_new_input(self):
-        for extra in [row('event_msg',{'type':'task_started','turn_id':'turn-2'},NOW-1505),
-                      row('response_item',{'role':'user','type':'message'},NOW-1505)]:
+        for extra in [row('event_msg',{'type':'task_started','turn_id':'turn-2'},NOW-1205),
+                      row('response_item',{'role':'user','type':'message'},NOW-1205)]:
             self.write(records()+[extra])
             self.assertEqual(m.eligibility(m.activity(self.file),self.c,NOW),'running-or-new-input')
 
     def test_idle_boundaries(self):
-        for elapsed, expected in [(1499,'not-idle-long-enough'),(1500,None),(1739,None),(1740,'missed-cache-window'),(1800,'missed-cache-window'),(90000,'missed-cache-window')]:
+        for elapsed, expected in [(1199,'not-idle-long-enough'),(1200,None),(1499,None),(1500,'missed-cache-window'),(1740,'missed-cache-window'),(1800,'missed-cache-window'),(90000,'missed-cache-window')]:
             a={**self.a,'usage_timestamp':NOW-elapsed}
             self.assertEqual(m.eligibility(a,self.c,NOW),expected)
 
@@ -163,6 +163,22 @@ class Tests(unittest.TestCase):
         self.ledger.status(aid,'completed')
         self.assertIsNone(self.ledger.reason('thread-1','turn-2',config,NOW+1500))
 
+    def test_previous_default_window_migrates_without_changing_approval_or_limits(self):
+        for enabled in (True, False):
+            old={**self.c,'idle_seconds':1500,'latest_start_seconds':1740,
+                 'enabled':enabled,'metered_automation_approved':enabled,
+                 'max_per_day':7,'max_per_month':20,'exclude_threads':['private-task']}
+            m.atomic_json(self.config_root/'config.json',old)
+            c=m.config_read(self.config_root)
+            self.assertEqual(c,{**old,'idle_seconds':1200,'latest_start_seconds':1500})
+            # Reading cannot clobber a concurrent pause/settings write.
+            self.assertEqual(json.loads((self.config_root/'config.json').read_text()),old)
+
+    def test_custom_window_is_preserved(self):
+        custom={**self.c,'idle_seconds':900,'latest_start_seconds':1440}
+        m.atomic_json(self.config_root/'config.json',custom)
+        self.assertEqual(m.config_read(self.config_root),custom)
+
     def test_expired_model_usage_cannot_be_refreshed_by_nonmodel_activity(self):
         self.write(records(NOW-600)+[row('event_msg',{'type':'task_complete','turn_id':'turn-1'},NOW-1500)])
         a=m.activity(self.file)
@@ -211,11 +227,11 @@ class Tests(unittest.TestCase):
         original=records()[2]
         original['payload']['response_id']='response-1'
         self.write(records()[:2]+[original]+records()[3:]+[{**original,'timestamp':row('',{},NOW)['timestamp']}])
-        self.assertEqual(m.activity(self.file)['usage_timestamp'],NOW-1530)
+        self.assertEqual(m.activity(self.file)['usage_timestamp'],NOW-1230)
         legacy=[r for r in records() if r['type']!='token_usage_record']
         repeated={**legacy[2],'timestamp':row('',{},NOW)['timestamp']}
         self.write(legacy+[repeated])
-        self.assertEqual(m.activity(self.file)['usage_timestamp'],NOW-1525)
+        self.assertEqual(m.activity(self.file)['usage_timestamp'],NOW-1225)
 
     def test_preflight_delay_past_window_does_not_reserve(self):
         a=self.a;clock=[NOW]
@@ -224,7 +240,7 @@ class Tests(unittest.TestCase):
             def __enter__(self):return self
             def __exit__(self,*args):pass
             def snapshot(self,tid):
-                clock[0]=a['usage_timestamp']+1740
+                clock[0]=a['usage_timestamp']+1500
                 return state(a)
             def compact(self,*args):raise AssertionError('must not dispatch')
         with patch.object(m.time,'time',side_effect=lambda:clock[0]),self.assertRaisesRegex(m.GuardError,'missed-cache-window'):
@@ -242,7 +258,7 @@ class Tests(unittest.TestCase):
             def compact(self,*args):raise AssertionError('must not dispatch')
         def slow_reserve(*args):
             result=reserve(*args)
-            clock[0]=a['usage_timestamp']+1740
+            clock[0]=a['usage_timestamp']+1500
             return result
         with patch.object(m.time,'time',side_effect=lambda:clock[0]),patch.object(self.ledger,'reserve',side_effect=slow_reserve):
             result=m.run_compaction({'id':'thread-1','path':self.file},a,self.c,self.config_root,
@@ -469,10 +485,101 @@ class Tests(unittest.TestCase):
         metrics=m.measurement(self.home,self.ledger)[0]
         self.assertEqual(metrics['compaction_usage']['input_tokens'],61000)
         self.assertEqual(metrics['first_resume_usage']['noncached_input_tokens'],11000)
+        self.assertEqual(metrics['cache_age_seconds'],1230)
+        self.assertEqual(metrics['configured_trigger_seconds'],1200)
+        self.assertEqual(metrics['configured_cutoff_seconds'],1500)
+        self.assertEqual(metrics['compaction_duration_seconds'],2)
+        self.assertAlmostEqual(metrics['compaction_usage']['cached_input_fraction'],60000/61000)
+        self.assertNotIn('PRIVATE',json.dumps(metrics))
         rollout.write_text(json.dumps(row('compacted',{},NOW+2))+'\n')
+        self.ledger.close();self.ledger=m.Ledger(self.config_root)
+        self.assertEqual(m.measurement(self.home,self.ledger)[0],metrics)
+        # Even after archival/removal, measurements already saved survive.
+        rollout.unlink()
+        with patch.object(m,'candidates',return_value=[]):
+            self.assertEqual(m.measurement(self.home,self.ledger)[0],metrics)
+
+    def test_missing_or_invalid_usage_stays_unknown(self):
+        self.ledger.reserve({'id':'thread-1'},self.a,self.c,NOW)
         metrics=m.measurement(self.home,self.ledger)[0]
         self.assertIsNone(metrics['compaction_usage'])
         self.assertIsNone(metrics['first_resume_usage'])
+        for usage in ({}, {'input_tokens':100,'output_tokens':10},
+                      {'input_tokens':100,'cached_input_tokens':110,'output_tokens':10},
+                      {'input_tokens':100,'cached_input_tokens':50,'output_tokens':None}):
+            self.assertIsNone(m.usage_counters(usage))
+            observations=m.observe_records([row('token_usage_record',{'usage':usage},NOW+1),
+                                            row('compacted',{},NOW+2)],NOW)
+            self.assertNotIn('compaction_usage',observations)
+
+    def test_later_compaction_cannot_replace_a_saved_measurement(self):
+        self.ledger.reserve({'id':'thread-1'},self.a,self.c,NOW)
+        self.write([row('token_usage_record',{'usage':{
+            'input_tokens':61000,'cached_input_tokens':60000,'output_tokens':100}},NOW+1),
+            row('compacted',{},NOW+2)])
+        with patch.object(m,'candidates',return_value=[{'path':self.file}]):
+            first=m.measurement(self.home,self.ledger)[0]
+            self.write([row('compacted',{},NOW+10000),row('response_item',{'role':'user'},NOW+10001),
+                        row('token_usage_record',{'usage':{
+                            'input_tokens':90000,'cached_input_tokens':0,'output_tokens':100}},NOW+10002)])
+            second=m.measurement(self.home,self.ledger)[0]
+        self.assertEqual(first,second)
+
+    def test_first_resume_is_collected_on_a_later_pass(self):
+        self.ledger.reserve({'id':'thread-1'},self.a,self.c,NOW)
+        original=[row('token_usage_record',{'usage':{
+            'input_tokens':61000,'cached_input_tokens':60000,'output_tokens':100}},NOW+1),
+            row('compacted',{},NOW+2)]
+        self.write(original)
+        with patch.object(m,'candidates',return_value=[{'path':self.file}]):
+            first=m.measurement(self.home,self.ledger)[0]
+            self.write(original+[row('response_item',{'role':'user'},NOW+100),
+                                 row('token_usage_record',{'usage':{
+                                     'input_tokens':10000,'cached_input_tokens':5000,'output_tokens':50}},NOW+101)])
+            second=m.measurement(self.home,self.ledger)[0]
+        self.assertEqual(first['compaction_usage'],second['compaction_usage'])
+        self.assertIsNone(first['first_resume_usage'])
+        self.assertEqual(second['first_resume_usage']['noncached_input_tokens'],5000)
+
+    def test_background_measurement_throttle_batch_and_fairness(self):
+        for i in range(6):
+            aid=self.ledger.reserve({'id':str(i)},{**self.a,'turn_id':str(i)},self.c,NOW+i)
+            self.ledger.status(aid,'completed')
+        with patch.object(m,'candidates',return_value=[]) as candidates,patch.object(m.time,'time',return_value=NOW+100):
+            m.measurement(self.home,self.ledger,refresh_limit=4)
+            self.assertEqual(candidates.call_count,4)
+            m.measurement(self.home,self.ledger,refresh_limit=4)
+            self.assertEqual(candidates.call_count,6)
+            m.measurement(self.home,self.ledger,refresh_limit=4)
+            self.assertEqual(candidates.call_count,6)
+        with patch.object(m,'candidates',return_value=[]) as candidates,patch.object(m.time,'time',return_value=NOW+400):
+            m.measurement(self.home,self.ledger,refresh_limit=4)
+            self.assertEqual(candidates.call_count,4)
+        with patch.object(m,'candidates') as candidates,patch.object(m.time,'time',return_value=NOW+31*86400):
+            m.measurement(self.home,self.ledger,refresh_limit=4)
+            candidates.assert_not_called()
+
+    def test_historical_age_backfill_does_not_invent_old_policy(self):
+        self.ledger.db.execute("INSERT INTO attempts VALUES(1,'thread-1','old',?,'completed',61000,0,?)",(NOW,NOW+2))
+        self.ledger.db.commit()
+        self.write(records()+[row('token_usage_record',{'usage':{
+            'input_tokens':61000,'cached_input_tokens':60000,'output_tokens':100}},NOW+1),
+            row('compacted',{},NOW+2)])
+        with patch.object(m,'candidates',return_value=[{'path':self.file}]):
+            metric=m.measurement(self.home,self.ledger)[0]
+        self.assertEqual(metric['cache_age_seconds'],1230)
+        self.assertIsNone(metric['configured_trigger_seconds'])
+        self.assertIsNone(metric['utility_version'])
+
+    def test_background_logging_continues_when_adapter_is_blocked(self):
+        def collect(*args):
+            (self.config_root/'restart-request').touch()
+        argv=['idle_compactor.py','--state',str(self.config_root),'watch']
+        with patch.object(m.sys,'argv',argv),patch.object(m,'scan',side_effect=m.GuardError('unsupported')), \
+             patch.object(m,'collect_measurements',side_effect=collect) as collect_mock, \
+             contextlib.redirect_stdout(io.StringIO()):
+            m.main()
+        collect_mock.assert_called_once()
 
     def test_ipc_real_socket_framing_and_final_timing_guard(self):
         # Real socket framing with a fake server; no model call. Verify the
@@ -518,7 +625,7 @@ class Tests(unittest.TestCase):
             self.assertEqual(client.snapshot('thread-1')['id'],'thread-1')
             with patch.object(m.time,'time',return_value=NOW):
                 client.compact(a['usage_timestamp'],self.c)
-            for age in (1740,1800,1801,90000):
+            for age in (1500,1740,1800,1801,90000):
                 with patch.object(m.time,'time',return_value=a['usage_timestamp']+age):
                     with self.assertRaisesRegex(m.DispatchSkipped,'missed-cache-window'):
                         client.compact(a['usage_timestamp'],self.c)

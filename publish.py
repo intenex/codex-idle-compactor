@@ -48,7 +48,7 @@ def main():
     (a.out/'update.json').write_bytes(raw)
     notes=a.out/'release-notes.md'
     notes.write_text('Signed automatic update for Codex Idle Compactor '+a.version+'.\n\n'
-                     'The per-task cooldown and cold-compaction override are removed. The utility triggers at 25 minutes since the last recorded model usage and stops dispatch before 29 minutes, with timing rechecked immediately before sending. This is a best-effort timing policy, not a guaranteed cache hit. Signed updates, existing attempt limits, and the ledger are preserved. See README.md for coverage and policy details.\n')
+                     'The utility now triggers at 20 minutes since the last recorded model usage and stops dispatch before 25 minutes. Existing 25/29-minute defaults migrate automatically; custom windows, pause state, approval, 50/day limits, and the ledger are preserved. Passive local logging saves attempt timing and observed cache counters across restarts and transcript changes, without extra model requests. Timing still does not guarantee cache hits or net savings. See README.md for details.\n')
     if a.publish:
         subprocess.run(['gh','release','create','v'+a.version,'--repo',u.REPO,'--draft',
                         '--title','Idle Compactor '+a.version,'--notes-file',str(notes),str(archive),str(a.out/'update.json')],check=True)

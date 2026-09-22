@@ -5,7 +5,7 @@ The update source is the latest non-prerelease release in `intenex/codex-idle-co
 ## Release procedure
 
 1. Edit the code and add regression coverage for the incompatible app behavior. Treat installed JavaScript as data when discovering capabilities; never execute it in the updater. Do not remove idle checks or spend limits to force compatibility.
-   Preserve the user-approved time-based policy: use the latest model-usage timestamp, trigger at 25 minutes, and stop dispatch before 29 minutes. Never describe this as a guaranteed cache hit. There is no per-task cooldown or cold-compaction bypass to restore.
+   Preserve the user-approved time-based policy: use the latest model-usage timestamp, trigger at 20 minutes, and stop dispatch before 25 minutes. Never describe this as a guaranteed cache hit. There is no per-task cooldown or cold-compaction bypass to restore.
 2. Increment `VERSION` in `idle_compactor.py` and `launcher.py`, and the version in `release.json`. Use a new numeric version for every release, including a release that restores older code.
 3. Run `python3 -m unittest discover -s . -v` and perform live read-only compatibility checks. If compaction behavior changed, distinguish simulated checks from a real accepted/completed operation.
 4. Commit and push the reviewed source to the repository's default branch.
@@ -34,6 +34,8 @@ Back up that private key securely. Public clients pin `release-public.pem`. Losi
 - The release sequence prevents a stale signed manifest from silently downgrading an installation. To intentionally ship older implementation code, assign it a new version/sequence and sign it normally.
 
 A new app feature can be unsupported until an adapter exists. Automatic updating distributes a fix; it cannot manufacture an API for ordinary ChatGPT conversations or promise compatibility before that interface is understood.
+
+Version 0.2.6 migrates the exact old default window (1,500/1,740 seconds) on config read to 1,200/1,500 seconds. Preserve custom settings and pause/approval state. Timing metadata and usage observations live in additive ledger tables so a rollback can still read the original attempts. Keep missing counters unknown and local transcript content out of observations. Passive collection is bounded to four attempts per scan, with a five-minute per-attempt refresh interval and a 30-day background lookback; it adds no model requests.
 
 ## Hosting and cost review
 

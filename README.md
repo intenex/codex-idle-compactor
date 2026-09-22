@@ -26,7 +26,7 @@ It does **not** cover ordinary ChatGPT web/Classic conversations, cloud or remot
 
 The independent update manager checks approximately every **30 minutes while the Mac is awake**, including when the app adapter is broken. It verifies an RSA/SHA-256 signature against the installed publisher key, checks the package digest, stages and self-checks the release, then switches versions at a worker boundary. The update manager itself is part of the updated release; a small recovery bootstrap remains installed.
 
-Settings, approval, daily/monthly attempt accounting, and conversation history are preserved. The retired `cooldown_seconds` setting is ignored and removed on the next settings write. A broken startup rolls back to the previous installed release, and a later signed fix can recover it. Offline machines continue using their installed version and retry later. Downloads are bounded; failures do not create a tight retry loop.
+Approval, attempt limits and accounting, custom settings, and conversation history are preserved. Version 0.2.6 automatically maps the previous default 25/29-minute window to 20/25 minutes; other custom windows are preserved. This takes effect on read and is saved by the next explicit settings write, without re-enabling paused installations. The retired `cooldown_seconds` setting is ignored and removed on the next settings write. A broken startup rolls back to the previous installed release, and a later signed fix can recover it. Offline machines continue using their installed version and retry later. Downloads are bounded; failures do not create a tight retry loop.
 
 Updates come from public GitHub releases. There is no hosted worker, paid update service, or GitHub Actions schedule. Updates do not upload your conversations or usage ledger. GitHub receives normal release-download requests.
 
@@ -34,8 +34,8 @@ Updates come from public GitHub releases. There is no hosted worker, paid update
 
 | Setting | Default |
 |---|---|
-| Trigger | 25 minutes since the most recent recorded model usage |
-| Latest dispatch | Strictly before 29 minutes since that usage; hard ceiling below 30 minutes |
+| Trigger | 20 minutes since the most recent recorded model usage |
+| Latest dispatch | Strictly before 25 minutes since that usage |
 | Context estimate | 1,024–1,000,000 tokens from the most recent request |
 | Per-task cooldown | None; each newly completed turn can qualify again |
 | Global attempts | 50/day (UTC); no monthly cap |
@@ -48,7 +48,7 @@ The counter limits bound utility attempts, not model output tokens, provider ret
 
 ### Timing and caching limits
 
-The app records when model usage is reported, **not the actual provider cache-write/reuse timestamp**. That recorded response timestamp is the timer's proxy. A valid candidate has a completed turn and usage age of at least 25 minutes and less than 29 minutes. The utility checks again after live-state preflight, after saving its attempt reservation, and immediately before sending the desktop compaction request. It never intentionally dispatches a request aged 30 minutes or more by that recorded timestamp. A safely rejected late request does not block other tasks; ambiguous requests are still never retried.
+The app records when model usage is reported, **not the actual provider cache-write/reuse timestamp**. That recorded response timestamp is the timer's proxy. A valid candidate has a completed turn and usage age of at least 20 minutes and less than 25 minutes. The utility checks again after live-state preflight, after saving its attempt reservation, and immediately before sending the desktop compaction request. With the default policy, it never intentionally dispatches a request aged 25 minutes or more by that recorded timestamp. A safely rejected late request does not block other tasks; ambiguous requests are still never retried.
 
 This is explicitly a time-based policy, not a cache-status guarantee. Cache routing, changed prefixes, uncached suffixes, model-specific retention, and the gap between request processing and usage reporting can still cause uncached tokens. The app may also queue an accepted request. The utility cannot guarantee the actual server execution time or cache state. OpenAI's API guide describes 30 minutes as a **minimum** cache lifetime for GPT-5.6 and later, not a universal ChatGPT/Codex expiry timestamp. Compaction can change the cached prefix.
 
@@ -73,7 +73,9 @@ python3 control.py uninstall
 
 `status` and worker health identify the policy as `time-based-best-effort` and explicitly report `cache_hit_guaranteed: false`.
 
-`metrics` reports observed usage where available; unknown usage stays null. `reconcile` recognizes a compaction that finished after a timeout without retrying it. The watcher also checks for late completion markers automatically; unresolved requests are never retried. The app's private operation has no atomic compare-and-compact condition, so a small race with new user input remains.
+`metrics` reports observed usage where available; unknown usage stays null. The watcher now saves these measurements in the local ledger automatically: attempt timestamp, usage age at reservation, configured trigger/cutoff, utility version, completion duration, cached/uncached input, cached fraction, output, and the first subsequent user-turn request when observed. Saved measurements survive restarts, software updates, and loss of the original transcript tail. Historical usage is backfilled where records still exist; old configured windows and versions remain unknown. Cache writes are listed separately and are included in the noncached-input total. No measurements are uploaded.
+
+Background collection reads at most four incomplete attempts per scan, at most once per five minutes per attempt, and only attempts from the last 30 days. Manual `metrics` can refresh older attempts. Already saved measurements have no automatic expiration. Logging also continues while compaction is paused or the app adapter is incompatible; it never triggers an extra model call. New results can be compared by recorded age and configured policy. A high cached fraction alone does not demonstrate net savings. `reconcile` recognizes a compaction that finished after a timeout without retrying it. The watcher also checks for late completion markers automatically; unresolved requests are never retried. The app's private operation has no atomic compare-and-compact condition, so a small race with new user input remains.
 
 Uninstall removes the background service but preserves settings and the ledger. Do not delete the ledger merely to reset limits. Local reports contain task IDs and scalar metadata, never saved copies of prompts, responses, or credentials.
 
