@@ -1,0 +1,351 @@
+import contextlib
+import datetime as dt
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import plistlib
+import socket
+import sqlite3
+import struct
+import tempfile
+import threading
+import time
+import unittest
+from unittest.mock import patch
+
+import idle_compactor as m
+
+NOW = 1800000000.0
+
+def row(typ, payload, when):
+    return dict(type=typ, payload=payload,
+                timestamp=dt.datetime.fromtimestamp(when, dt.timezone.utc).isoformat())
+
+def records(now=NOW):
+    return [row('event_msg', {'type':'task_started','turn_id':'turn-1'}, now-1600),
+            row('response_item', {'type':'message','role':'user','content':'PRIVATE'}, now-1590),
+            row('token_usage_record', {'usage':{'input_tokens':60000,'cached_input_tokens':59000,
+                    'output_tokens':1000}}, now-1530),
+            row('event_msg', {'type':'token_count','info':{'last_token_usage':{
+                'input_tokens':90000,'output_tokens':1000}}}, now-1525),
+            row('event_msg', {'type':'task_complete','turn_id':'turn-1'}, now-1510)]
+
+def state(a, tid='thread-1'):
+    return dict(id=tid, hostId='local', resumeState='resumed', requests=[],
+                threadRuntimeStatus={'type':'idle'}, latestTokenUsageInfo={'last':{
+                    'inputTokens':a['input_tokens'],'outputTokens':a['output_tokens']}})
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.file = self.root/'test.jsonl'
+        self.home = self.root/'codex'
+        self.home.mkdir()
+        self.app = self.root/'ChatGPT.app'
+        (self.app/'Contents').mkdir(parents=True)
+        info=dict(zip(('CFBundleIdentifier','CFBundleShortVersionString','CFBundleVersion'),('com.openai.codex','26.908.40834','8881')))
+        (self.app/'Contents/Info.plist').write_bytes(plistlib.dumps(info))
+        self.archive()
+        self.config_root = self.root/'state'
+        m.config_read(self.config_root)
+        self.write(records())
+        self.a = m.activity(self.file)
+        self.ledger = m.Ledger(self.config_root)
+        self.c = dict(m.DEFAULTS)
+
+    def archive(self,versions=None):
+        versions=versions or {'thread-owner-discovery':1,'thread-stream-following-changed':1,
+                             'thread-stream-state-changed':11,'thread-follower-compact-thread':1}
+        js=('const protocols='+json.dumps(versions)).encode()
+        tree={'files':{'.vite':{'files':{'build':{'files':{'src.js':{'size':len(js),'offset':'0'}}}}}}}
+        head=json.dumps(tree).encode()
+        resources=self.app/'Contents/Resources';resources.mkdir(exist_ok=True)
+        (resources/'app.asar').write_bytes(struct.pack('<4I',4,len(head)+8,len(head)+4,len(head))+head+js)
+        m.compatibility._archive_versions.cache_clear()
+
+    def tearDown(self):
+        self.ledger.close()
+        self.temp.cleanup()
+
+    def write(self, rows):
+        self.file.write_text(''.join(json.dumps(x)+'\n' for x in rows))
+
+    def test_eligible(self):
+        self.assertIsNone(m.eligibility(self.a,self.c,NOW))
+        self.assertEqual(self.a['context_tokens'],61000)
+        self.assertNotIn('PRIVATE',json.dumps(self.a))
+
+    def test_modern_usage_not_double_counted(self):
+        self.assertEqual(self.a['input_tokens'],60000)
+
+    def test_legacy_fallback(self):
+        self.write([r for r in records() if r['type']!='token_usage_record'])
+        self.assertEqual(m.activity(self.file)['context_tokens'],91000)
+
+    def test_running_and_new_input(self):
+        for extra in [row('event_msg',{'type':'task_started','turn_id':'turn-2'},NOW-1505),
+                      row('response_item',{'role':'user','type':'message'},NOW-1505)]:
+            self.write(records()+[extra])
+            self.assertEqual(m.eligibility(m.activity(self.file),self.c,NOW),'running-or-new-input')
+
+    def test_idle_boundaries(self):
+        for elapsed, expected in [(1499,'not-idle-long-enough'),(1500,None),(1739,None),(1740,'missed-idle-window'),(90000,'missed-idle-window')]:
+            a={**self.a,'last_activity':NOW-elapsed}
+            self.assertEqual(m.eligibility(a,self.c,NOW),expected)
+
+    def test_compacted_after_completion(self):
+        a={**self.a,'compacted':self.a['completed']+1}
+        self.assertEqual(m.eligibility(a,self.c,NOW),'already-compacted')
+
+    def test_context_bounds(self):
+        for n in [49999,180001]:
+            self.assertEqual(m.eligibility({**self.a,'context_tokens':n},self.c,NOW),'context-outside-pilot-range')
+
+    def test_truncated_record_ignored(self):
+        with self.file.open('a') as f:f.write('{"type":')
+        self.assertEqual(m.activity(self.file)['fingerprint'],self.a['fingerprint'])
+
+    def test_corrupt_record_fails_closed(self):
+        with self.file.open('a') as f:f.write('not-json\n')
+        with self.assertRaises(m.GuardError):m.activity(self.file)
+
+    def test_active_pending_wrong_host_mismatch(self):
+        for update in [dict(threadRuntimeStatus={'type':'active'}),dict(requests=[{}]),
+                       dict(hostId='remote'),dict(resumeState='needs_resume'),dict(sideConversation=True),
+                       dict(latestTokenUsageInfo={'last':{}})]:
+            s={**state(self.a),**update}
+            with self.assertRaises(m.GuardError):m.live_guard(s,self.a,self.c,'thread-1')
+        self.assertEqual(m.live_guard(state(self.a),self.a,self.c,'thread-1'),61000)
+
+    def test_reservation_blocks_all_other_calls(self):
+        aid=self.ledger.reserve({'id':'thread-1'},self.a,self.c,NOW)
+        self.assertEqual(self.ledger.reason('thread-2','turn-2',self.c,NOW),'unresolved-attempt-review-required')
+        self.ledger.status(aid,'completed')
+        self.assertEqual(self.ledger.reason('thread-1','turn-1',self.c,NOW),'already-attempted-this-turn')
+        self.assertEqual(self.ledger.reason('thread-1','turn-2',self.c,NOW),'per-task-cooldown')
+
+    def test_limits_and_restart(self):
+        for i in range(2):
+            aid=self.ledger.reserve({'id':str(i)},{**self.a,'turn_id':str(i)},self.c,NOW)
+            self.ledger.status(aid,'completed')
+        self.ledger.close();self.ledger=m.Ledger(self.config_root)
+        self.assertEqual(self.ledger.reason('third','third',self.c,NOW),'daily-cap')
+        c={**self.c,'max_per_day':10,'max_per_month':2}
+        self.assertEqual(self.ledger.reason('third','third',c,NOW),'monthly-cap')
+
+    def test_single_instance_lock(self):
+        with m.exclusive(self.config_root):
+            with self.assertRaises(m.GuardError):
+                with m.exclusive(self.config_root):pass
+
+    def test_default_disabled_and_invalid_config(self):
+        self.assertFalse(m.config_read(self.config_root)['enabled'])
+        for update in [{'max_per_day':100},{'idle_seconds':1800},{'enabled':'false'}, {'allow_threads':'*'}]:
+            m.atomic_json(self.config_root/'config.json',{**m.DEFAULTS,**update})
+            with self.assertRaises(m.GuardError):m.config_read(self.config_root)
+
+    def test_future_build_accepted_by_capabilities(self):
+        p=self.app/'Contents/Info.plist';x=plistlib.loads(p.read_bytes());x['CFBundleVersion']='future'
+        p.write_bytes(plistlib.dumps(x))
+        self.assertEqual(m.verify_app(self.app)[2],'future')
+
+    def test_unknown_mutation_contract_blocks(self):
+        self.archive({'thread-owner-discovery':1,'thread-stream-following-changed':1,
+                      'thread-stream-state-changed':45,'thread-follower-compact-thread':9})
+        with self.assertRaises(m.GuardError):m.verify_app(self.app)
+
+    def test_new_snapshot_protocol_can_be_probed(self):
+        self.archive({'thread-owner-discovery':1,'thread-stream-following-changed':1,
+                      'thread-stream-state-changed':45,'thread-follower-compact-thread':1})
+        self.assertEqual(m.compatibility.read_protocol(self.app)['versions']['thread-stream-state-changed'],45)
+
+    def test_older_idle_shape(self):
+        s=state(self.a);del s['threadRuntimeStatus']
+        s['turns']=[{'turnId':self.a['turn_id'],'status':'completed'}]
+        self.assertEqual(m.live_guard(s,self.a,self.c,'thread-1'),61000)
+        s['turns'][-1]['status']='inProgress'
+        with self.assertRaises(m.GuardError):m.live_guard(s,self.a,self.c,'thread-1')
+
+    def test_candidate_scope(self):
+        sessions=self.home/'sessions';sessions.mkdir()
+        db=sqlite3.connect(self.home/'state_99.sqlite')
+        db.execute('CREATE TABLE threads(id,rollout_path,source,model,archived,updated_at)')
+        data=[('ok',str(sessions/'one'),'desktop','m',0,NOW),
+              ('archived',str(sessions/'two'),'vscode','m',1,NOW),
+              ('subagent',str(sessions/'three'),'{"subagent":{}}','m',0,NOW),
+              ('external',str(self.file),'vscode','m',0,NOW),
+              ('stale',str(sessions/'old'),'vscode','m',0,NOW-9999)]
+        db.executemany('INSERT INTO threads VALUES(?,?,?,?,?,?)',data);db.commit();db.close()
+        self.assertEqual([r['id'] for r in m.candidates(self.home,NOW)],['ok'])
+
+    def test_no_completion_without_marker(self):
+        a=self.a;test=self
+        class Fake:
+            def __init__(self,*args):pass
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def snapshot(self,tid):return state(a)
+            def compact(self):pass
+        with patch.object(m.time,'time',return_value=NOW):
+            r=m.run_compaction({'id':'thread-1','path':self.file},a,self.c,self.config_root,
+                self.home,self.app,self.ledger,desktop_factory=Fake,timeout=0)
+        self.assertEqual(r['status'],'unverified-timeout-no-retry')
+        self.assertEqual(self.ledger.reason('other','other',self.c,NOW),'unresolved-attempt-review-required')
+
+    def test_success_requires_marker(self):
+        a=self.a;test=self
+        class Fake:
+            def __init__(self,*args):pass
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def snapshot(self,tid):return state(a)
+            def compact(self):test.write(records()+[row('compacted',{},NOW)])
+        with patch.object(m.time,'time',return_value=NOW):
+            r=m.run_compaction({'id':'thread-1','path':self.file},a,self.c,self.config_root,
+                self.home,self.app,self.ledger,desktop_factory=Fake)
+        self.assertEqual(r['status'],'completed')
+
+    def test_kill_switch_blocks_dispatch(self):
+        a=self.a
+        class Fake:
+            called=False
+            def __init__(self,*args):pass
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def snapshot(self,tid):return state(a)
+            def compact(self):Fake.called=True
+        with self.assertRaises(m.GuardError):
+            m.run_compaction({'id':'thread-1','path':self.file},a,self.c,self.config_root,
+                self.home,self.app,self.ledger,automatic=True,desktop_factory=Fake)
+        self.assertFalse(Fake.called)
+        self.assertEqual(self.ledger.summary(),[])
+
+    def test_activity_changed_prevents_dispatch(self):
+        a=self.a;test=self
+        class Fake:
+            def __init__(self,*args):pass
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def snapshot(self,tid):
+                test.write(records()+[row('response_item',{'role':'user'},NOW)])
+                return state(a)
+            def compact(self):raise AssertionError('must not dispatch')
+        with self.assertRaises(m.GuardError):
+            m.run_compaction({'id':'thread-1','path':self.file},a,self.c,self.config_root,
+                self.home,self.app,self.ledger,desktop_factory=Fake)
+        self.assertEqual(self.ledger.summary(),[])
+
+    def test_uncertain_request_never_retried(self):
+        a=self.a
+        class Fake:
+            def __init__(self,*args):pass
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def snapshot(self,tid):return state(a)
+            def compact(self):raise TimeoutError()
+        with patch.object(m.time,'time',return_value=NOW):
+            with self.assertRaises(TimeoutError):
+                m.run_compaction({'id':'thread-1','path':self.file},a,self.c,self.config_root,
+                    self.home,self.app,self.ledger,desktop_factory=Fake)
+        self.assertEqual(self.ledger.summary(),[{'status':'uncertain-no-retry','count':1}])
+
+    def test_scope_change_blocks_dispatch(self):
+        a=self.a;test=self
+        class Fake:
+            def __init__(self,*args):pass
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def snapshot(self,tid):
+                m.atomic_json(test.config_root/'config.json',{**m.DEFAULTS,'exclude_threads':['thread-1']})
+                return state(a)
+            def compact(self):raise AssertionError('must not dispatch')
+        with self.assertRaises(m.GuardError):
+            m.run_compaction({'id':'thread-1','path':self.file},a,self.c,self.config_root,
+                self.home,self.app,self.ledger,desktop_factory=Fake)
+        self.assertEqual(self.ledger.summary(),[])
+
+    def test_uninstall_reports_failure_and_preserves_plist(self):
+        from types import SimpleNamespace
+        path=self.root/'Library/LaunchAgents'/(m.LABEL+'.plist')
+        path.parent.mkdir(parents=True);path.write_text('fixture')
+        with patch.object(m.sys,'platform','darwin'),patch.object(m.Path,'home',return_value=self.root):
+            with patch.object(m.subprocess,'run',return_value=SimpleNamespace(returncode=0)):
+                with self.assertRaises(m.GuardError):m.launch_agent(None,remove=True)
+            self.assertTrue(path.exists())
+            with patch.object(m.subprocess,'run',return_value=SimpleNamespace(returncode=1)):
+                self.assertFalse(m.launch_agent(None,remove=True)['installed'])
+            self.assertFalse(path.exists())
+
+    def test_usage_measurement_unknown_and_deduplicated(self):
+        sessions=self.home/'sessions';sessions.mkdir()
+        rollout=sessions/'session.jsonl'
+        db=sqlite3.connect(self.home/'state_5.sqlite')
+        db.execute('CREATE TABLE threads(id,rollout_path,source,model,archived,updated_at)')
+        db.execute('INSERT INTO threads VALUES(?,?,?,?,?,?)',('thread-1',str(rollout),'vscode','m',0,NOW))
+        db.commit();db.close()
+        aid=self.ledger.reserve({'id':'thread-1'},self.a,self.c,NOW)
+        compact_usage=row('token_usage_record',{'response_id':'compact','usage':{
+            'input_tokens':61000,'cached_input_tokens':60000,'output_tokens':1200}},NOW+1)
+        resumed=row('token_usage_record',{'response_id':'resume','usage':{
+            'input_tokens':12000,'cached_input_tokens':1000,'output_tokens':100}},NOW+2000)
+        records_=[compact_usage,compact_usage,row('compacted',{},NOW+2),
+                  row('response_item',{'role':'user'},NOW+1990),resumed]
+        rollout.write_text(''.join(json.dumps(r)+'\n' for r in records_))
+        metrics=m.measurement(self.home,self.ledger)[0]
+        self.assertEqual(metrics['compaction_usage']['input_tokens'],61000)
+        self.assertEqual(metrics['first_resume_usage']['noncached_input_tokens'],11000)
+        rollout.write_text(json.dumps(row('compacted',{},NOW+2))+'\n')
+        metrics=m.measurement(self.home,self.ledger)[0]
+        self.assertIsNone(metrics['compaction_usage'])
+        self.assertIsNone(metrics['first_resume_usage'])
+
+    def test_ipc_real_socket_framing_and_dispatch(self):
+        # Full client protocol over a real Unix socket; no model call.
+        ipc=self.home/'ipc';ipc.mkdir(mode=0o700)
+        path=ipc/'ipc.sock'
+        server=socket.socket(socket.AF_UNIX);server.bind(str(path));path.chmod(0o600);server.listen(1)
+        methods=[];errors=[];a=self.a
+        def serve():
+            try:
+                conn,_=server.accept();conn.settimeout(3)
+                def receive():
+                    def read(n):
+                        out=b''
+                        while len(out)<n:
+                            x=conn.recv(n-len(out))
+                            if not x:raise EOFError()
+                            out+=x
+                        return out
+                    return json.loads(read(struct.unpack('<I',read(4))[0]))
+                def send(obj):
+                    b=json.dumps(obj).encode();packet=struct.pack('<I',len(b))+b
+                    conn.sendall(packet[:2]);conn.sendall(packet[2:9]);conn.sendall(packet[9:])
+                while True:
+                    q=receive();method=q.get('method');methods.append(method)
+                    if q['type']=='request':
+                        if method=='initialize':result={'clientId':'watcher'};owner='watcher'
+                        elif method=='thread-owner-discovery':result={};owner='owner'
+                        elif method=='thread-follower-compact-thread':result={'ok':True};owner='owner'
+                        else:raise AssertionError(method)
+                        send(dict(type='response',requestId=q['requestId'],resultType='success',
+                                  result=result,handledByClientId=owner,method=method))
+                    elif method=='thread-stream-following-changed':
+                        if not q['params']['following']:break
+                        send(dict(type='broadcast',method='thread-stream-state-changed',version=11,
+                                  sourceClientId='owner',params=dict(hostId='local',conversationId='thread-1',
+                                  change={'type':'snapshot','conversationState':state(a)})))
+                conn.close()
+            except Exception as e:errors.append(e)
+            finally:server.close()
+        t=threading.Thread(target=serve);t.start()
+        with m.Desktop(self.home,self.app) as client:
+            self.assertEqual(client.snapshot('thread-1')['id'],'thread-1')
+            client.compact()
+        t.join(4)
+        self.assertFalse(t.is_alive());self.assertEqual(errors,[])
+        self.assertIn('thread-follower-compact-thread',methods)
+
+if __name__=='__main__':unittest.main()

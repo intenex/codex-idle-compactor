@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+*.sqlite*
+*.zip
+update.json
+*.tmp
+*private*.pem
+*signing*.pem
