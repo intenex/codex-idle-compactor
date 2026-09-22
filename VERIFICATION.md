@@ -22,6 +22,7 @@ No claim is made that compaction always saves tokens or that private app interfa
 - A safely rejected request after a slow reservation counts against the daily cap but does not block unrelated tasks; uncertain dispatch still blocks retries. Live desktop idleness, pending input, scope, and completion checks remain.
 - Live read-only IPC verification passed on ChatGPT/Codex 26.908.40834, build 8881. Usage records provide response reporting timestamps and token counters; no actual cache-expiration timestamp is exposed on the inspected path.
 - The desktop interface has no verified server-enforced cache-only operation. The owner explicitly chose timing alone; the utility reports that cache hits are not guaranteed. No claim of zero uncached tokens or net savings is made.
+- The installed background updater delivered 0.2.4 → 0.2.5, reached healthy worker state, and promoted 0.2.5 to its last known good release. The ledger digest was unchanged across the upgrade. Automatic operation was re-enabled with a 1,500-second trigger, 1,740-second cutoff, 50/day, no monthly cap, and no cooldown setting. The feed reports current with no update error.
 
 ## Historical live evidence on 2026-09-22 (0.2.4 and earlier)
 
