@@ -23,7 +23,7 @@ import time
 import uuid
 import compatibility
 
-VERSION = '0.2.2'
+VERSION = '0.2.3'
 FRAME_LIMIT = 32 * 1024 * 1024
 TAIL_LIMIT = 16 * 1024 * 1024
 DEFAULTS = dict(enabled=False, idle_seconds=1500, latest_start_seconds=1740,
@@ -329,7 +329,7 @@ def candidates(home, now, thread_id=None):
         yield dict(id=row['id'],path=path,model=row['model'])
 
 
-def eligibility(a, c, now):
+def eligibility(a, c, now, allow_cold=False):
     if not a['turn_id'] or not a['completed'] or not a['usage_timestamp']:
         return 'no-complete-turn-or-usage'
     if a['started'] > a['completed'] or a['user_timestamp'] > a['completed']:
@@ -339,7 +339,7 @@ def eligibility(a, c, now):
     idle = now - a['last_activity']
     if idle < c['idle_seconds']:
         return 'not-idle-long-enough'
-    if idle >= c['latest_start_seconds']:
+    if not allow_cold and idle >= c['latest_start_seconds']:
         return 'missed-idle-window'
     if not c['min_context_tokens'] <= a['context_tokens'] <= c['max_context_tokens']:
         return 'context-outside-configured-range'
@@ -443,7 +443,9 @@ class Ledger:
 
 
 def run_compaction(row, a, c, root, home, app, ledger, automatic=False,
-                   desktop_factory=Desktop, timeout=180):
+                   desktop_factory=Desktop, timeout=180, allow_cold=False):
+    if automatic and allow_cold:
+        raise GuardError('Cold compaction requires an explicit manual task')
     with desktop_factory(home, app) as desktop:
         state = desktop.snapshot(row['id'])
         live_guard(state, a, c, row['id'])
@@ -456,7 +458,7 @@ def run_compaction(row, a, c, root, home, app, ledger, automatic=False,
             raise GuardError('Automatic compaction is paused')
         if row['id'] in current['exclude_threads'] or (current['allow_threads'] and row['id'] not in current['allow_threads']):
             raise GuardError('Task excluded by current configuration')
-        reason = eligibility(fresh, current, time.time())
+        reason = eligibility(fresh, current, time.time(), allow_cold=allow_cold)
         if reason:
             raise GuardError(reason)
         attempt = ledger.reserve(row, fresh, current, time.time())
@@ -489,7 +491,9 @@ def run_compaction(row, a, c, root, home, app, ledger, automatic=False,
         return {'thread_id': row['id'], 'status': 'unverified-timeout-no-retry'}
 
 
-def scan(root, home, app, execute=False, thread_id=None):
+def scan(root, home, app, execute=False, thread_id=None, allow_cold=False):
+    if allow_cold and not thread_id:
+        raise GuardError('Cold compaction requires an explicit manual task')
     c = config_read(root)
     verify_app(app)
     if execute and not thread_id and not (c['enabled'] and c['metered_automation_approved']):
@@ -497,19 +501,22 @@ def scan(root, home, app, execute=False, thread_id=None):
     ledger = Ledger(root)
     output = []
     try:
+        # A late completion marker resolves an old attempt without another call.
+        # Missing markers continue to block dispatch; no ambiguous request is retried.
+        ledger.reconcile(home)
         for row in candidates(home, time.time(), thread_id):
             if row['id'] in c['exclude_threads'] or (c['allow_threads'] and row['id'] not in c['allow_threads']):
                 continue
             try:
                 a = activity(row['path'])
-                reason = eligibility(a, c, time.time()) or ledger.reason(row['id'], a['turn_id'], c, time.time())
+                reason = eligibility(a, c, time.time(), allow_cold=allow_cold) or ledger.reason(row['id'], a['turn_id'], c, time.time())
                 entry = dict(thread_id=row['id'], context_tokens=a['context_tokens'],
                              idle_seconds=round(time.time() - a['last_activity']),
                              decision=reason or 'candidate-needs-live-check')
                 if not reason:
                     if execute:
                         entry = run_compaction(row, a, c, root, home, app, ledger,
-                                               automatic=thread_id is None)
+                                               automatic=thread_id is None, allow_cold=allow_cold)
                     else:
                         with Desktop(home, app) as desktop:
                             state = desktop.snapshot(row['id'])
@@ -633,6 +640,7 @@ def main():
         subs.add_parser(name)
     p = subs.add_parser('compact', help='One explicit, manually invoked compaction of an eligible task')
     p.add_argument('thread_id')
+    p.add_argument('--allow-cold', action='store_true', help='Allow this one idle task after the normal 29-minute window; its cache may be cold')
     p = subs.add_parser('enable', help='Approve recurring metered compactions with explicit attempt caps')
     p.add_argument('--accept-metered-compaction', action='store_true', required=True)
     p.add_argument('--max-per-day', type=int, required=True)
@@ -687,14 +695,16 @@ def main():
         finally:
             ledger.close()
         return
+    if args.command == 'reconcile':
+        # Read-only session inspection and transactional ledger reconciliation can
+        # coexist with the watcher; this command never dispatches model work.
+        ledger = Ledger(args.state)
+        try:
+            print(json.dumps(ledger.reconcile(args.codex_home)))
+        finally:
+            ledger.close()
+        return
     with exclusive(args.state):
-        if args.command == 'reconcile':
-            ledger = Ledger(args.state)
-            try:
-                print(json.dumps(ledger.reconcile(args.codex_home)))
-            finally:
-                ledger.close()
-            return
         if args.command == 'watch':
             last = None
             while True:
@@ -721,7 +731,8 @@ def main():
                 time.sleep(interval)
         else:
             out = scan(args.state, args.codex_home, args.app,
-                       execute=args.command in ('once', 'compact'), thread_id=getattr(args, 'thread_id', None))
+                       execute=args.command in ('once', 'compact'), thread_id=getattr(args, 'thread_id', None),
+                       allow_cold=getattr(args, 'allow_cold', False))
             print(json.dumps(out, indent=2))
 
 if __name__ == '__main__':

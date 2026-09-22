@@ -100,6 +100,14 @@ class Tests(unittest.TestCase):
         a={**self.a,'compacted':self.a['completed']+1}
         self.assertEqual(m.eligibility(a,self.c,NOW),'already-compacted')
 
+    def test_manual_cold_override_preserves_idle_and_busy_guards(self):
+        a={**self.a,'last_activity':NOW-90000}
+        self.assertIsNone(m.eligibility(a,self.c,NOW,allow_cold=True))
+        self.assertEqual(m.eligibility(self.a,self.c,NOW-100,allow_cold=True),'not-idle-long-enough')
+        self.assertEqual(m.eligibility({**a,'started':NOW},self.c,NOW,allow_cold=True),'running-or-new-input')
+        with self.assertRaises(m.GuardError):
+            m.scan(self.config_root,self.home,self.app,execute=True,allow_cold=True)
+
     def test_compaction_before_turn_complete_is_not_repeated(self):
         a={**self.a,'compacted':self.a['completed']-0.017}
         self.assertEqual(m.eligibility(a,self.c,NOW),'already-compacted')
@@ -281,6 +289,18 @@ class Tests(unittest.TestCase):
                 m.run_compaction({'id':'thread-1','path':self.file},a,self.c,self.config_root,
                     self.home,self.app,self.ledger,desktop_factory=Fake)
         self.assertEqual(self.ledger.summary(),[{'status':'uncertain-no-retry','count':1}])
+
+    def test_scan_resolves_late_marker_without_another_model_call(self):
+        aid=self.ledger.reserve({'id':'thread-1'},self.a,self.c,NOW-30)
+        self.ledger.status(aid,'unverified-timeout-no-retry')
+        self.write(records()+[row('compacted',{},NOW-10)])
+        m.atomic_json(self.config_root/'config.json',{**self.c,'enabled':True,'metered_automation_approved':True})
+        candidate={'id':'thread-1','path':self.file}
+        with patch.object(m,'candidates',return_value=[candidate]),patch.object(m.time,'time',return_value=NOW),patch.object(m,'Desktop') as desktop:
+            result=m.scan(self.config_root,self.home,self.app,execute=True)
+        desktop.assert_not_called()
+        self.assertEqual(result[0]['decision'],'already-compacted')
+        self.assertEqual(self.ledger.summary(),[{'status':'completed','count':1}])
 
     def test_scope_change_blocks_dispatch(self):
         a=self.a;test=self

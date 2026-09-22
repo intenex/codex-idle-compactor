@@ -11,7 +11,7 @@ The update source is the latest non-prerelease release in `intenex/codex-idle-co
 5. Publish locally with the command below. It reruns tests, builds a ZIP from an explicit file allowlist, signs its manifest, creates a draft release, uploads all assets, then publishes it as latest.
 
 ```sh
-python3 publish.py --version 0.2.2 --out /path/to/release-output --publish
+python3 publish.py --version 0.2.4 --out /path/to/release-output --publish
 ```
 
 Use the actual next version in that command. No release or build job runs automatically on GitHub. The CLI needs the maintainer's GitHub login and local signing key. Never put the private signing key in this repository, a release, or a friend's installation.

@@ -46,6 +46,8 @@ Assistant/tool activity resets the quiet period. Busy tasks are skipped. Missed 
 
 The counter limits bound utility attempts, not model output tokens, provider retries, dollars, or subscription quota. Compaction can consume more tokens than it saves. Token savings have not been established. See [OpenAI's caching guide](https://developers.openai.com/api/docs/guides/prompt-caching) and [compaction guide](https://developers.openai.com/api/docs/guides/compaction).
 
+A maintenance-only `compact THREAD_ID --allow-cold` command can explicitly compact one task beyond the normal window while the watcher is stopped. It still requires 25 minutes of idleness, live desktop ownership, and remaining attempt allowance. Cold compaction may consume uncached tokens.
+
 ## Control and diagnostics
 
 From any copy of this download folder:
@@ -63,7 +65,7 @@ python3 control.py uninstall
 
 `control.py` always targets the installed version. `update` requests an immediate check; normal checks happen automatically. `update-status` shows the installed version, update status, and whether the compactor is running or compatibility-blocked.
 
-`metrics` reports observed usage where available; unknown usage stays null. `reconcile` recognizes a compaction that finished after a timeout without retrying it. The app's private operation has no atomic compare-and-compact condition, so a small race with new user input remains.
+`metrics` reports observed usage where available; unknown usage stays null. `reconcile` recognizes a compaction that finished after a timeout without retrying it. The watcher also checks for late completion markers automatically; unresolved requests are never retried. The app's private operation has no atomic compare-and-compact condition, so a small race with new user input remains.
 
 Uninstall removes the background service but preserves settings and the ledger. Do not delete the ledger merely to reset limits. Local reports contain task IDs and scalar metadata, never saved copies of prompts, responses, or credentials.
 
